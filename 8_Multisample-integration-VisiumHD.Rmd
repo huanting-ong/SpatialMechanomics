@@ -1,0 +1,1353 @@
+---
+title: "8_Multisample-integration-VisiumHD.Rmd"
+author: "Huan Ting Ong"
+subtitle: >
+  Integrates the four Visium HD capture areas at 4 um into one annotated
+  object, and exports the marker genes used for cell identity assignment.
+output: 
+  html_document: 
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width = 6,
+                      fig.height = 5,
+                      echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+**Parameters**
+
+| | |
+|---|---|
+| Bin size | 4 um, selected in script 7 |
+| UMI cutoff | bins below 50 UMIs removed |
+| Normalisation | library size, median UMI count as scale factor |
+| BANKSY | `k_geom = 6`, `lambda = 0.3`, `npcs = 20`, `compute_agf = TRUE`, seed 1000. Coordinates staggered across capture areas so neighbourhoods do not cross samples |
+| Harmony | applied to `PCA_M1_lam0.3`, grouped by capture area, 20 iterations |
+| Clustering | Louvain over dimensions 1 to 20, resolutions 0.2 to 1.0 evaluated by clustree. Resolution 0.8 selected. Clusters 38 to 42 removed as low-count artifacts, leaving 38 annotated populations |
+| Markers | `FindAllMarkers`, positive only, log2FC >= 0.5, adjusted p < 0.05, ranked by `MG_score = avg_log2FC x (pct.1 - pct.2) x -log10(p_adj + 1e-300)` |
+
+**Actions required**
+
+Run in RStudio. Set the paths to the four Space Ranger outputs. Requires
+`options(future.globals.maxSize)` raised; 100 GB is set here.
+
+**Input**
+
+Space Ranger filtered feature-barcode matrices at 4 um for the four capture
+areas, loaded as on-disk sparse matrices with BPCells. CytAssist alignment is
+assumed to have been done in Loupe Browser before Space Ranger.
+
+**Output**
+
+| File | Contents |
+|---|---|
+| `spe_full_after_computeBanksy.rds` | after neighbourhood augmentation |
+| `spe_full_after_BANKSY_PCA.rds` | after PCA on the BANKSY matrix |
+| `spe_full_banksythenHarmony_b4clusterBanksy.rds` | after Harmony, before clustering |
+| `merge_full_HarmonyBANKSY_SeuratClusters.rds` | after clustering |
+| `merge_full_HarmonyBANKSY_SeuratClusters_annotated.rds` | annotated object carrying `annot_cluster` and `tissue_compartment`. Input to script 10 |
+| `cluster_counts_res_<res>.csv` | bins per cluster at each resolution tested |
+| `resolution_summary.csv` | cluster count per resolution |
+| `<prefix>_markers_MGscore.csv` | ranked marker genes per cluster |
+| `<prefix>_markers_MGscore_AvgExpr_ranked.csv` | the same with average expression, the source of Supplementary Table 2 |
+| `<prefix>_AggregateExpression.csv` | mean expression per cluster |
+
+Produces Fig. 2e to g and Supplementary Fig. 4.
+
+Adapted from
+[Complete_Visium_HD_multi-sample_integration](https://colab.research.google.com/drive/1dH-WSCYYGaHE20oSyqRBR4f6O_aDIA4r)
+and
+[Banksy spatial data integration with Harmony](https://prabhakarlab.github.io/Banksy/articles/batch-correction.html),
+modified for 4 um bins.
+
+# Load required packages.
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(BPCells)
+library(SeuratWrappers)
+library(Matrix)
+library(future)
+library(patchwork)
+library(clustree)
+library(arrow)
+library(dplyr)
+library(readr)
+library(viridisLite)
+library(ggsci)
+library(ggthemes)
+library(tidyr)
+library(tibble)
+library(Banksy)
+library(scico)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(scran)
+library(data.table)
+library(harmony)
+library(scater)
+library(cowplot)
+library(Polychrome)
+library(ggrastr)
+
+options(future.globals.maxSize = 100 * 1024^3) #100 GB
+
+big_fonts <- theme(
+  plot.title   = element_text(size = 24, face = "bold", hjust = 0.5),
+  axis.title   = element_text(size = 22),
+  axis.text    = element_text(size = 18),
+  legend.title = element_text(size = 20),
+  legend.text  = element_text(size = 18),
+  legend.position = "right")
+
+big_legend_keys <- guides(
+  colour = guide_legend(override.aes = list(size = 6)),
+  fill   = guide_legend(override.aes = list(size = 6)))
+
+options(ggrepel.max.overlaps = 30)
+
+convert_gene_ids <- function(count_mat, features_path) {
+  features <- read.table(features_path, sep = "\t", header = FALSE)
+  features <- features[features$V3 == "Gene Expression", ]
+  features <- features[match(rownames(count_mat), features$V1), ]
+  rownames(count_mat) <- features$V2
+  return(count_mat)}
+```
+
+# Load and write 4µm sample data as on-disk matrices
+We work at 4 µm so that each bin approximates a small or confined cell.
+This section uses BPCells to keep the raw matrices on disk. 
+```{r}
+hto_01 <- open_matrix_10x_hdf5(
+  path = "Z:/Visium_Data/HTO-01-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix.h5",
+  feature_type = "Gene Expression")
+write_matrix_dir(mat = hto_01,
+                 dir = "Z:/Visium_Data/hto_01_matrix",
+                 overwrite = TRUE)
+hto_02 <- open_matrix_10x_hdf5(
+  path = "Z:/Visium_Data/HTO-02-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix.h5",
+  feature_type = "Gene Expression")
+write_matrix_dir(mat = hto_02,
+                 dir = "Z:/Visium_Data/hto_02_matrix",
+                 overwrite = TRUE)
+hto_03 <- open_matrix_10x_hdf5(
+  path = "Z:/Visium_Data/HTO-03-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix.h5",
+  feature_type = "Gene Expression")
+write_matrix_dir(mat = hto_03,
+                 dir = "Z:/Visium_Data/hto_03_matrix",
+                 overwrite = TRUE)
+hto_04 <- open_matrix_10x_hdf5(
+  path = "Z:/Visium_Data/HTO-04-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix.h5",
+  feature_type = "Gene Expression")
+write_matrix_dir(mat = hto_04,
+                 dir = "Z:/Visium_Data/hto_04_matrix",
+                 overwrite = TRUE)
+
+# Load the on-disk matrices back:
+hto_01_count <- open_matrix_dir(dir = "Z:/Visium_Data/hto_01_matrix")
+hto_02_count <- open_matrix_dir(dir = "Z:/Visium_Data/hto_02_matrix")
+hto_03_count <- open_matrix_dir(dir = "Z:/Visium_Data/hto_03_matrix")
+hto_04_count <- open_matrix_dir(dir = "Z:/Visium_Data/hto_04_matrix")
+
+# Make bin IDs unique across samples:  
+colnames(hto_01_count) <- paste(colnames(hto_01_count), "CA_01", sep = ".")
+colnames(hto_02_count) <- paste(colnames(hto_02_count), "CA_02", sep = ".")
+colnames(hto_03_count) <- paste(colnames(hto_03_count), "CA_03", sep = ".")
+colnames(hto_04_count) <- paste(colnames(hto_04_count), "CA_04", sep = ".")
+
+#Convert Ensembl IDs to gene symbols using *features.tsv.gz* function set above
+hto_01_count <- convert_gene_ids(hto_01_count, "Z:/Visium_Data/HTO-01-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix/features.tsv.gz")
+hto_02_count <- convert_gene_ids(hto_02_count, "Z:/Visium_Data/HTO-02-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix/features.tsv.gz")
+hto_03_count <- convert_gene_ids(hto_03_count, "Z:/Visium_Data/HTO-03-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix/features.tsv.gz")
+hto_04_count <- convert_gene_ids(hto_04_count, "Z:/Visium_Data/HTO-04-IF-001/binned_outputs/square_004um/filtered_feature_bc_matrix/features.tsv.gz")
+```
+
+# Create a Seurat object from the four matrices
+```{r}
+countlist <- list(hto_01_count, hto_02_count, hto_03_count, hto_04_count)
+names(countlist) <- c("hto01", "hto02", "hto03", "hto04")
+merge.obj <- CreateSeuratObject(countlist)
+merge.obj
+# Add a samples column in meta.data for sample identity
+samples <- sapply(strsplit(colnames(merge.obj), "\\."), function(X) { return(X[2]) })
+merge.obj$samples <- samples
+table(merge.obj$samples)
+```
+
+# QC on 4 µm bins and sketching
+We inspect the UMI distribution per 4 µm bin and choose a lower cutoff to remove very low quality bins.
+Here we plot distribution of UMI count per 4um bin in a histogram plot and based on it decide lower cutoff in transcript counts (aiming to remove bins with low UMIs). The determination of lower cutoff can be subjective. There is no gold-standard rule.  
+```{r distUMIcountsperbin}
+df <- data.frame(UMIs = merge.obj$nCount_RNA)
+p_umi_dist <- ggplot(df, aes(x = UMIs)) +
+  geom_histogram(bins = 100, fill = "grey80", color = "black", size = 0.1) +
+  geom_vline(xintercept = 200, color = "#9370DB", linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(limits = c(0, 4000), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 450000), expand = c(0,0)) +
+  labs(x = "UMI count per 4 µm bin",
+       y = "Frequency") +
+  ggtitle("UMI distribution (all samples, 4 µm bins)") +
+  theme_bw() +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.margin = margin(0, 0, 0, 0, unit = "pt"))
+
+ggsave("UMI_distribution_4um_bins.png",  p_umi_dist, width = 8, height = 5, dpi = 600)
+ggsave("UMI_distribution_4um_bins.tiff", p_umi_dist, width = 8, height = 5, dpi = 600, device = "tiff")
+ggsave("UMI_distribution_4um_bins.svg",  p_umi_dist, width = 8, height = 5, device = "svg")
+```
+
+Zoom in to the lower range:
+```{r distUMIcountsperbin_zoom}
+df_zoom <- data.frame(UMIs = merge.obj$nCount_RNA)
+
+p_umi_zoom <- ggplot(df_zoom, aes(x = UMIs)) +
+  geom_histogram(binwidth = 1, fill = "grey80", color = "black", linewidth = 0.1) +
+  geom_vline(xintercept = 40, color = "#9370DB", linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = 50, color = "#008080", linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = 80, color = "#A6A600", linetype = "dashed", linewidth = 0.5) +
+  coord_cartesian(xlim = c(0, 200)) +
+  labs(x = "UMI count per 4 µm bin", y = "Frequency") +
+  ggtitle("UMI distribution - lower range") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        axis.title = element_text(size = 12),
+        axis.text  = element_text(size = 10))
+
+ggsave("UMI_distribution_lower_end.png",  p_umi_zoom, width = 14, height = 6, dpi = 600)
+ggsave("UMI_distribution_lower_end.tiff", p_umi_zoom, width = 14, height = 6, dpi = 600, device = "tiff")
+ggsave("UMI_distribution_lower_end.svg",  p_umi_zoom, width = 14, height = 6, device = "svg")
+```
+
+# Spatial inference & batch correction
+Combine Banksy & Harmony
+```{r}
+# Apply filtering - only remove bins less than 50 counts per bin
+# Checked 50-80 spatially, and also bins above 98^th^ percentile and saw useful bins
+# 98^th^ to 99.5^th^ percentile have 59,282 bins which co-localises with oocytes and CL 
+lower_cutoff <- 50
+merge.obj <- subset(merge.obj, 
+                    subset = nCount_RNA >= lower_cutoff)
+
+# Normalize by library size (total UMI count), using median as scale factor
+merge.obj <- NormalizeData(merge.obj,
+                           scale.factor = median(merge.obj$nCount_RNA),
+                           verbose = FALSE)
+# Identify variable features
+merge.obj <- FindVariableFeatures(merge.obj, verbose = FALSE)
+
+# KEEP full object
+merge.full <- merge.obj
+
+# Join RNA layers before converting to SingleCellExperiment
+merge.full[["RNA"]] <- JoinLayers(merge.full[["RNA"]])
+
+# Convert Seurat object to SpatialExperiment for BANKSY
+library(SpatialExperiment)
+
+sce.full <- as.SingleCellExperiment(merge.full)
+
+spe.full <- SpatialExperiment(assays = assays(sce.full),
+                              colData = colData(sce.full),
+                              rowData = rowData(sce.full),
+                              reducedDims = reducedDims(sce.full))
+
+# Normalisation
+aname <- "normcounts"
+assay(spe.full, aname) <- GetAssayData(merge.full, assay = "RNA", layer = "data")
+hvg_use <- VariableFeatures(merge.full)
+spe.full <- spe.full[hvg_use, ]
+
+# Add spatial coordinates from parquet files and stagger them across capture areas
+sample_files <- list(
+  "CA_01" = "Z:/Visium_Data/HTO-01-IF-001/binned_outputs/square_004um/spatial/tissue_positions.parquet",
+  "CA_02" = "Z:/Visium_Data/HTO-02-IF-001/binned_outputs/square_004um/spatial/tissue_positions.parquet",
+  "CA_03" = "Z:/Visium_Data/HTO-03-IF-001/binned_outputs/square_004um/spatial/tissue_positions.parquet",
+  "CA_04" = "Z:/Visium_Data/HTO-04-IF-001/binned_outputs/square_004um/spatial/tissue_positions.parquet"
+)
+
+coord_df <- purrr::map_dfr(names(sample_files), function(sid) {
+  df <- read_parquet(sample_files[[sid]])
+  df %>%
+    transmute(
+      barcode_full = paste0(barcode, ".", sid),
+      sample_id = sid,
+      in_tissue = in_tissue,
+      sdimx = array_col,
+      sdimy = array_row
+    )
+})
+
+# keep only cells present in spe.full and align row order exactly
+coord_df <- coord_df %>%
+  filter(barcode_full %in% colnames(spe.full))
+
+coord_df <- coord_df[match(colnames(spe.full), coord_df$barcode_full), ]
+stopifnot(all(coord_df$barcode_full == colnames(spe.full)))
+
+# store metadata
+colData(spe.full)$sample_group <- coord_df$sample_id
+colData(spe.full)$samples <- coord_df$sample_id
+colData(spe.full)$in_tissue <- coord_df$in_tissue
+
+# original coordinates
+locs <- as.matrix(coord_df[, c("sdimx", "sdimy")])
+rownames(locs) <- coord_df$barcode_full
+
+# stagger coordinates across samples so BANKSY does not mix samples spatially
+locs_dt <- data.table(cbind(locs, group = factor(coord_df$sample_id)))
+colnames(locs_dt) <- c("sdimx", "sdimy", "group")
+
+locs_dt[, sdimx := sdimx - min(sdimx), by = group]
+global_max <- max(locs_dt$sdimx) * 1.5
+locs_dt[, sdimx := sdimx + as.integer(group) * global_max]
+
+locs_staggered <- as.matrix(locs_dt[, .(sdimx, sdimy)])
+rownames(locs_staggered) <- coord_df$barcode_full
+spatialCoords(spe.full) <- locs_staggered
+
+cat("Full BANKSY-ready SPE dims:", dim(spe.full), "\n")
+
+# Compute BANKSY on the full data
+compute_agf <- TRUE
+k_geom <- 6
+lambda <- 0.3
+npcs <- 20
+SEED <- 1000
+spe.full <- computeBanksy(
+  spe.full,
+  assay_name  = aname,
+  compute_agf = compute_agf,
+  k_geom      = k_geom)
+
+saveRDS(spe.full, "spe_full_after_computeBanksy.rds")
+cat("Saved full BANKSY-computed object.\n")
+
+# Run BANKSY PCA on the full data FIRST
+spe.full <- runBanksyPCA(
+  spe.full,
+  use_agf = compute_agf,
+  lambda  = lambda,
+  npcs    = npcs,
+  group   = "sample_group",
+  seed    = SEED)
+
+saveRDS(spe.full, "spe_full_after_BANKSY_PCA.rds")
+cat("Saved full BANKSY PCA object.\n")
+
+# Harmony on BANKSY PCs
+set.seed(SEED)
+harmony_embedding <- harmony::HarmonyMatrix(
+  data_mat = reducedDim(spe.full, "PCA_M1_lam0.3"),
+  meta_data = as.data.frame(colData(spe.full)),
+  vars_use = "sample_group",
+  do_pca = FALSE,
+  max.iter.harmony = 20,
+  verbose = FALSE)
+
+reducedDim(spe.full, "Harmony_BANKSY") <- harmony_embedding
+
+# Save checkpoint before clustering
+saveRDS(spe.full,
+  file = "Z:/Visium_Data/01_Multi-sample-integration/spe_full_banksythenHarmony_b4clusterBanksy.rds"
+)
+
+# Load the saved full BANKSY+Harmony object
+spe.full <- readRDS(
+  "Z:/Visium_Data/01_Multi-sample-integration/spe_full_banksythenHarmony_b4clusterBanksy.rds"
+)
+```
+
+# Clustering with Seurat
+```{r}
+# Check cell order matches
+stopifnot(all(colnames(merge.full) == colnames(spe.full)))
+
+# Copy Harmony-corrected BANKSY embedding into Seurat
+merge.full[["harmony_banksy"]] <- CreateDimReducObject(
+  embeddings = reducedDim(spe.full, "Harmony_BANKSY"),
+  key = "HBANKSY_", assay = "RNA")
+
+merge.full[["banksy.pca"]] <- CreateDimReducObject(
+  embeddings = reducedDim(spe.full, "PCA_M1_lam0.3"),
+  key = "BANKSYPCA_", assay = "RNA")
+
+# UMAP on the pre-Harmony BANKSY embedding
+merge.full <- RunUMAP(
+  object = merge.full,
+  reduction = "banksy.pca",
+  dims = 1:npcs,
+  reduction.name = "umap.banksy",
+  verbose = FALSE)
+
+# UMAP on the Harmony_BANKSY embedding
+merge.full <- RunUMAP(
+  object = merge.full,
+  reduction = "harmony_banksy",
+  dims = 1:npcs,
+  reduction.name = "umap.harmony_banksy",
+  verbose = FALSE)
+
+# Graph clustering on Harmony_BANKSY
+seurat_res <- c(0.2, 0.4, 0.6, 0.8, 1.0)
+
+merge.full <- FindNeighbors(
+  object = merge.full,
+  reduction = "harmony_banksy",
+  dims = 1:npcs, verbose = FALSE)
+
+merge.full <- FindClusters(
+  object = merge.full,
+  resolution = seurat_res,
+  verbose = FALSE)
+
+# Inspect available clustering columns
+grep("^RNA_snn_res\\.", colnames(merge.full[[]]), value = TRUE)
+
+# Pick one working resolution
+Idents(merge.full) <- "RNA_snn_res.0.6"
+table(Idents(merge.full))
+
+# Plot UMAPs
+p_umap_preharmony <- DimPlot(
+  object = merge.full,
+  reduction = "umap.banksy",
+  pt.size = 0.03,
+  group.by = "samples",
+  raster = FALSE,
+  cols = c(
+    "CA_01" = "#9370DB",
+    "CA_02" = "#008080",
+    "CA_03" = "#E69F00",
+    "CA_04" = "#CC79A7")) +
+  ggtitle("BANKSY UMAP before Harmony") +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 24, face = "bold"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 18)) + big_fonts + big_legend_keys
+
+p_umap_harmony_banksy <- DimPlot(
+  object = merge.full,
+  reduction = "umap.harmony_banksy",
+  pt.size = 0.03,
+  group.by = "samples",
+  raster = FALSE,
+  cols = c(
+    "CA_01" = "#9370DB",
+    "CA_02" = "#008080",
+    "CA_03" = "#E69F00",
+    "CA_04" = "#CC79A7")) +
+  ggtitle("Harmony-corrected BANKSY UMAP") +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 24, face = "bold"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 18)) + big_fonts + big_legend_keys
+
+p_umap_preharmony
+p_umap_harmony_banksy
+
+ggsave("UMAP_BANKSY_before_Harmony.png", p_umap_preharmony, width = 6, height = 5, dpi = 600)
+ggsave("UMAP_BANKSY_before_Harmony.tiff", p_umap_preharmony, width = 6, height = 5, dpi = 600, device = "tiff")
+ggsave("UMAP_BANKSY_before_Harmony.svg", rasterise(p_umap_preharmony, dpi = 600), width = 6, height = 5, device = "svg")
+
+ggsave("UMAP_BANKSY_after_Harmony.png", p_umap_harmony_banksy, width = 6, height = 5, dpi = 600)
+ggsave("UMAP_BANKSY_after_Harmony.tiff", p_umap_harmony_banksy, width = 6, height = 5, dpi = 600, device = "tiff")
+ggsave("UMAP_BANKSY_after_Harmony.svg", rasterise(p_umap_harmony_banksy, dpi = 600), width = 6, height = 5, device = "svg")
+
+saveRDS(merge.full,
+  file = "Z:/Visium_Data/01_Multi-sample-integration/merge_full_HarmonyBANKSY_SeuratClusters.rds")
+
+## Load last RDS using detected path
+merge.full <- readRDS(
+  "Z:/Visium_Data/01_Multi-sample-integration/merge_full_HarmonyBANKSY_SeuratClusters.rds")
+```
+
+# Review all res clustering
+```{r}
+cluster_cols <- grep("^RNA_snn_res\\.", colnames(merge.full[[]]), value = TRUE)
+print(cluster_cols)
+
+out_root <- "Z:/Visium_Data/01_Multi-sample-integration/HarmonyBANKSY_SeuratClusterOutputs"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(out_root, "cluster_counts_csv"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(out_root, "umap_by_resolution"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(out_root, "spatial_by_resolution"), showWarnings = FALSE, recursive = TRUE)
+
+# Clustree
+p_clustree <- clustree(merge.full, prefix = "RNA_snn_res.")
+p_clustree
+ggsave(
+  filename = file.path(out_root, "clustree_HarmonyBANKSY_Seurat.png"),
+  plot = p_clustree, width = 12, height = 8, dpi = 600)
+ggsave(
+  filename = file.path(out_root, "clustree_HarmonyBANKSY_Seurat.tiff"),
+  plot = p_clustree, width = 12, height = 8, dpi = 600, device = "tiff")
+ggsave(
+  filename = file.path(out_root, "clustree_HarmonyBANKSY_Seurat.svg"),
+  plot = p_clustree, width = 12, height = 8, device = "svg")
+
+# Export counts for each resolution
+export_idents_tables_septly <- function(obj, prefix, out_dir) {
+  md <- obj[[]]
+  res_cols <- names(md)[startsWith(names(md), prefix)]
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  for (col in res_cols) {
+    res <- sub(prefix, "", col, fixed = TRUE)
+    v   <- md[[col]]
+    tab <- table(v, useNA = "no")
+    df  <- data.frame(cluster  = names(tab),
+                      n_bins   = as.integer(tab),
+                      pct_bins = as.numeric(tab) / sum(tab),
+                      stringsAsFactors = FALSE)
+    df <- df[order(df$n_bins, decreasing = TRUE), ]
+    write.csv(df, file = file.path(out_dir, paste0("cluster_counts_res_", res, ".csv")),
+              row.names = FALSE)
+  }
+  invisible(res_cols)
+}
+export_idents_tables_septly(merge.full, prefix = "RNA_snn_res.",
+                            out_dir = file.path(out_root, "cluster_counts_csv"))
+
+# Resolution summary table
+resolution_summary <- do.call(rbind, lapply(cluster_cols, function(col) {
+  vals <- merge.full[[col]]
+  data.frame(resolution = sub("^RNA_snn_res\\.", "", col),
+             n_clusters = length(unique(vals[!is.na(vals)])),
+             stringsAsFactors = FALSE)
+}))
+write.csv(resolution_summary, file = file.path(out_root, "resolution_summary.csv"),
+          row.names = FALSE)
+
+# Batlow palette for plots by resolution (38–43 distinct colours)
+# scico::scico(n, palette = "batlow") gives perceptually uniform sequential colours
+# For categorical cluster use, we sample evenly across the palette
+batlow_res_cols <- function(n) {
+  scico::scico(n, palette = "batlow")
+}
+
+# --- UMAP per resolution ---
+for (col in cluster_cols) {
+  res <- sub("^RNA_snn_res\\.", "", col)
+
+  # Build same alphabetic palette as spatial loop
+  cl_levels <- sort(as.character(unique(na.omit(as.character(merge.full[[]][[col]])))))
+  cl_pal    <- setNames(batlow_res_cols(length(cl_levels)), cl_levels)
+
+  p_umap_res <- DimPlot(merge.full, reduction = "umap.harmony_banksy",
+    group.by = col, label = TRUE, repel = TRUE, pt.size = 0.03, raster = FALSE,
+    cols = cl_pal) +
+    ggtitle(paste0("Seurat clusters on Harmony_BANKSY (res = ", res, ")")) +
+    theme(plot.title   = element_text(hjust = 0.5, size = 16, face = "bold"),
+          legend.title = element_blank(),
+          legend.text  = element_text(size = 12)) + big_fonts + big_legend_keys
+
+  ggsave(file.path(out_root, "umap_by_resolution",
+                   paste0("UMAP_HarmonyBANKSY_clusters_res_", res, ".png")),
+         p_umap_res, width = 16, height = 10, dpi = 600)
+  ggsave(file.path(out_root, "umap_by_resolution",
+                   paste0("UMAP_HarmonyBANKSY_clusters_res_", res, ".tiff")),
+         p_umap_res, width = 16, height = 10, dpi = 600, device = "tiff")
+  ggsave(file.path(out_root, "umap_by_resolution",
+                   paste0("UMAP_HarmonyBANKSY_clusters_res_", res, ".svg")),
+         rasterise(p_umap_res, dpi = 300, dev = "ragg_png"),
+         width = 16, height = 10, device = "svg")
+}
+
+# Build spatial coordinate mapping (used here and in final annotation plots)
+mapping_df_4 <- purrr::map_dfr(names(sample_files), function(sid) {
+  df <- arrow::read_parquet(sample_files[[sid]])
+  df %>% dplyr::mutate(samples = sid, barcode_full = paste0(barcode, ".", sid))
+})
+
+# --- Spatial plot per resolution ---
+for (col in cluster_cols) {
+  res <- sub("^RNA_snn_res\\.", "", col)
+
+  cluster_df_full <- data.frame(
+    barcode_full  = colnames(merge.full),
+    samples       = merge.full$samples,
+    cluster_value = as.character(merge.full[[]][[col]]),
+    stringsAsFactors = FALSE)
+
+  cluster_coords <- mapping_df_4 %>%
+    dplyr::filter(barcode_full %in% colnames(merge.full)) %>%
+    dplyr::left_join(cluster_df_full, by = c("barcode_full", "samples"))
+
+  cluster_coords$cluster_value <- factor(
+    cluster_coords$cluster_value,
+    levels = sort(as.character(
+      unique(na.omit(cluster_coords$cluster_value)))))
+
+  cl_levels <- levels(cluster_coords$cluster_value)
+  cl_pal    <- setNames(batlow_res_cols(length(cl_levels)), cl_levels)
+
+  p_spatial_res <- ggplot(cluster_coords,
+      aes(x = array_col, y = -array_row, color = cluster_value)) +
+    rasterise(geom_point(shape = ".", na.rm = TRUE), dpi = 600, dev = "ragg_png") +
+    scale_color_manual(values = cl_pal, na.value = "grey85") +
+    coord_fixed() +
+    theme_linedraw() +
+    facet_wrap(~samples, ncol = 4) +
+    guides(color = guide_legend(override.aes = list(shape = 16, size = 8))) +
+    ggtitle(paste0("Spatial map of Seurat clusters on Harmony_BANKSY (res = ", res, ")")) +
+    theme(panel.grid    = element_blank(),
+          axis.title    = element_blank(),
+          axis.text     = element_blank(),
+          axis.ticks    = element_blank(),
+          strip.background = element_rect(fill = NA, color = NA),
+          plot.title    = element_text(hjust = 0.5, size = 18, face = "bold"),
+          strip.text    = element_text(size = 14, face = "bold"),
+          legend.text   = element_text(size = 12),
+          panel.background = element_rect(fill = "transparent", colour = NA),
+          plot.background  = element_rect(fill = "transparent", colour = NA)) +
+    big_fonts
+
+  ggsave(file.path(out_root, "spatial_by_resolution",
+                   paste0("Spatial_clusters_res_", res, ".png")),
+         p_spatial_res, width = 20, height = 8, dpi = 600, bg = "transparent")
+  ggsave(file.path(out_root, "spatial_by_resolution",
+                   paste0("Spatial_clusters_res_", res, ".tiff")),
+         p_spatial_res, width = 20, height = 8, dpi = 600, device = "tiff",
+         bg = "transparent")
+  ggsave(file.path(out_root, "spatial_by_resolution",
+                   paste0("Spatial_clusters_res_", res, ".svg")),
+         rasterise(p_spatial_res, dpi = 300, dev = "ragg_png"), 
+         width = 20, height = 8, device = "svg", bg = "transparent")
+}
+```
+
+
+# Chosen working resolution = 0.8 — DEG and marker gene dotplots
+```{r}
+merge.full$cluster_working <- merge.full$RNA_snn_res.0.8
+Idents(merge.full) <- "cluster_working"
+table(Idents(merge.full))
+
+p_umap_clusters_working <- DimPlot(merge.full, reduction = "umap.harmony_banksy",
+  pt.size = 0.03, group.by = "cluster_working",
+  label = TRUE, repel = TRUE, raster = FALSE) +
+  ggtitle("Seurat clusters on Harmony_BANKSY (working res = 0.8)") +
+  theme(plot.title   = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.title = element_blank(),
+        legend.text  = element_text(size = 12)) + big_fonts + big_legend_keys
+
+p_umap_clusters_working
+
+ggsave("UMAP_HarmonyBANKSY_clusters_working_res0.8.png",
+       p_umap_clusters_working, width = 16, height = 10, dpi = 600)
+ggsave("UMAP_HarmonyBANKSY_clusters_working_res0.8.tiff",
+       p_umap_clusters_working, width = 16, height = 10, dpi = 600, device = "tiff")
+ggsave("UMAP_HarmonyBANKSY_clusters_working_res0.8.svg",
+       rasterise(p_umap_clusters_working, dpi = 600), width = 16, height = 10, device = "svg")
+
+# FindAllMarkers for working resolution = 0.8
+eps       <- 1e-300
+logfc_thr <- 0.5
+padj_thr  <- 0.05
+
+compute_markers_MG_AvgExpr <- function(obj, group_col, tag,
+                                       assay = "RNA",
+                                       logfc.threshold = 0.5,
+                                       padj.threshold  = 0.05,
+                                       out_prefix = tag) {
+  stopifnot(group_col %in% colnames(obj[[]]))
+  DefaultAssay(obj) <- assay
+  
+  markers <- FindAllMarkers(obj, group.by = group_col, only.pos = TRUE,
+                            logfc.threshold = logfc.threshold, verbose = TRUE) %>%
+    dplyr::filter(p_val_adj < padj.threshold) %>%
+    dplyr::mutate(cluster  = as.character(cluster),
+                  gene     = as.character(gene),
+                  MG_score = avg_log2FC * (pct.1 - pct.2) * (-log10(p_val_adj + eps)))
+
+  write.csv(markers, file = paste0(out_prefix, "_markers_MGscore.csv"), row.names = FALSE)
+
+  agg <- AggregateExpression(object = obj, assays = assay,
+                             group.by = group_col, return.seurat = FALSE)[[assay]]
+  write.csv(as.data.frame(as.matrix(agg)),
+            file = paste0(out_prefix, "_AggregateExpression.csv"), row.names = TRUE)
+
+  agg_cols    <- colnames(agg)
+  prefix_type <- dplyr::case_when(
+    all(grepl("^g\\d+$", agg_cols)) ~ "g",
+    all(grepl("^X\\d+$", agg_cols)) ~ "X",
+    all(grepl("^\\d+$",  agg_cols)) ~ "none",
+    TRUE ~ "other")
+
+  cluster_to_agg_col <- function(cluster_chr) {
+    if (prefix_type == "g")    return(paste0("g", cluster_chr))
+    if (prefix_type == "X")    return(paste0("X", cluster_chr))
+    if (prefix_type == "none") return(cluster_chr)
+    cands <- c(cluster_chr, paste0("g", cluster_chr), paste0("X", cluster_chr))
+    hit   <- cands[cands %in% agg_cols]
+    if (length(hit) == 0) NA_character_ else hit[[1]]
+  }
+
+  markers2 <- markers %>%
+    dplyr::mutate(agg_cluster = vapply(cluster, cluster_to_agg_col, character(1)))
+
+  gi <- match(markers2$gene,        rownames(agg))
+  ci <- match(markers2$agg_cluster, colnames(agg))
+  markers2$avg_expr <- agg[cbind(gi, ci)]
+
+  markers2 <- markers2 %>%
+    dplyr::filter(!is.na(avg_expr)) %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::arrange(dplyr::desc(MG_score), dplyr::desc(avg_expr), .by_group = TRUE) %>%
+    dplyr::mutate(rank_within_cluster = dplyr::row_number()) %>%
+    dplyr::ungroup()
+
+  write.csv(markers2, file = paste0(out_prefix, "_markers_MGscore_AvgExpr_ranked.csv"),
+            row.names = FALSE)
+  invisible(list(markers = markers, markers_ranked = markers2, agg = agg))
+}
+
+deg_out_dir <- file.path(out_root, "deg_working_res0.8")
+dir.create(deg_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+markers_res_08 <- compute_markers_MG_AvgExpr(
+  obj        = merge.full,
+  group_col  = "cluster_working",
+  tag        = "HarmonyBANKSY_working_res0.8",
+  assay      = "RNA",
+  logfc.threshold = logfc_thr,
+  padj.threshold  = padj_thr,
+  out_prefix = file.path(deg_out_dir, "HarmonyBANKSY_working_res0.8"))
+
+# =============================================================================
+# Marker gene dotplots — res = 0.8
+# =============================================================================
+DefaultAssay(merge.full) <- "RNA"
+merge.full[["RNA"]] <- JoinLayers(merge.full[["RNA"]])
+
+dotplot_dir   <- file.path(out_root, "dotplots_by_resolution")
+dir.create(dotplot_dir, showWarnings = FALSE, recursive = TRUE)
+min_bins_for_plot <- 50
+cluster_col   <- "RNA_snn_res.0.8"
+
+# Marker panels — v5 (literature-verified, DEG cross-referenced)
+marker_panels_A <- list(
+  GC_broad          = c("Inha", "Gja1", "Foxl2", "Amh"),
+  GC_preantral      = c("Kctd14", "Rgs2", "Amhr2"),
+  GC_antral         = c("Inhbb", "Serpine2", "Nap1l5"),
+  GC_mitotic        = c("Top2a", "Ccnd2", "Mki67", "Ccna2"),
+  GC_atretic        = c("Foxo1", "Ghr", "Pik3ip1", "Ivns1abp"),
+  Oocyte            = c("Ooep", "Zp3", "Nlrp14"),
+  Luteal            = c("Cyp11a1", "Hsd3b1", "Fdx1", "Star"),
+  Luteal_early      = c("Lhcgr", "Prlr", "Parm1"),
+  Luteal_late       = c("Akr1c18", "S100a6", "Onecut2"),
+  Luteal_regressing = c("Ptgfr", "Cdkn1a", "Sdc4")
+)
+
+marker_panels_B <- list(
+  Stromal       = c("Dcn", "Vim", "Col1a1", "Pdgfra"),
+  Theca         = c("Aldh1a1", "Cyp17a1", "Mgarp"),
+  Immune_mac    = c("Ptprc", "Cd68", "C1qa", "Mrc1"),
+  Immune_lympho = c("Cd79a", "Ms4a1"),
+  OSE           = c("Krt19", "Upk3b", "Epcam"),
+  SMC           = c("Tagln", "Acta2", "Myh11"),
+  Pericyte      = c("Pdgfrb", "Rgs5"),
+  Endo_vasc     = c("Cldn5", "Pecam1", "Flt1"),
+  Endo_lymph    = c("Ccl21a", "Lyve1", "Prox1")
+)
+
+# Helper: vline positions and panel label midpoints
+make_marker_layout <- function(marker_panels, genes_present) {
+  panel_sizes <- vapply(marker_panels, function(x) sum(x %in% genes_present), integer(1))
+  panel_sizes <- panel_sizes[panel_sizes > 0]
+  vline_pos   <- cumsum(panel_sizes) + 0.5
+  vline_pos   <- vline_pos[vline_pos < (sum(panel_sizes) + 0.5)]
+  starts      <- c(1, head(cumsum(panel_sizes) + 1, -1))
+  ends        <- cumsum(panel_sizes)
+  mids        <- (starts + ends) / 2
+  label_df    <- data.frame(subgroup = names(panel_sizes), x = mids,
+                            stringsAsFactors = FALSE)
+  list(panel_sizes = panel_sizes, vline_pos = vline_pos, label_df = label_df)
+}
+
+# Check all marker genes are present
+all_genes <- unique(unlist(c(marker_panels_A, marker_panels_B), use.names = FALSE))
+missing_genes <- setdiff(all_genes, rownames(merge.full))
+if (length(missing_genes) > 0) {
+  message("Genes not found in dataset: ", paste(missing_genes, collapse = ", "))
+} else {
+  message("All marker genes found in dataset.")
+}
+
+# Filter clusters below minimum bin count
+grp            <- as.character(merge.full[[]][[cluster_col]])
+cluster_counts <- table(grp)
+keep_clusters  <- names(cluster_counts)[cluster_counts >= min_bins_for_plot]
+cells_keep     <- colnames(merge.full)[grp %in% keep_clusters]
+plot_obj       <- subset(merge.full, cells = cells_keep)
+
+# Y-axis: numerical order, 0 at bottom
+present_clusters <- as.character(unique(as.character(plot_obj[[]][[cluster_col]])))
+final_order      <- as.character(sort(as.integer(present_clusters)))
+
+plot_obj$cluster_plot <- factor(as.character(plot_obj[[]][[cluster_col]]),
+                                levels = final_order)
+
+n_clusters_plot <- nlevels(plot_obj$cluster_plot)
+plot_height     <- max(9, 0.32 * n_clusters_plot + 3)
+
+dotplot_theme <- theme(
+  plot.title   = element_text(size = 12, hjust = 0.5, face = "bold"),
+  axis.title.y = element_text(size = 11, hjust = 0.5),
+  axis.text.x  = element_text(angle = 45, vjust = 0.5, hjust = 1,
+                               size = 8, margin = margin(t = 2)),
+  axis.text.y  = element_text(size = 8),
+  legend.title = element_text(size = 10),
+  legend.text  = element_text(size = 8),
+  plot.margin  = margin(t = 10, r = 10, b = 120, l = 10))
+
+make_dotplot <- function(obj, panels, title_str, annot_labels) {
+  genes_use <- unique(unlist(panels, use.names = FALSE))
+  genes_use <- genes_use[genes_use %in% rownames(obj)]
+  layout    <- make_marker_layout(panels, genes_use)
+  DotPlot(obj, features = genes_use, group.by = "cluster_plot",
+          col.min = 0, col.max = 2.5, dot.scale = 6,
+          cluster.idents = FALSE, cols = c("#FFF0F5", "#510f50")) +
+    RotatedAxis() +
+    ggplot2::geom_vline(xintercept = layout$vline_pos,
+                        linewidth = 0.3, alpha = 0.6, colour = "grey40") +
+    ggplot2::annotate("text", x = layout$label_df$x, y = -1.8,
+                      label = layout$label_df$subgroup,
+                      size = 3.2, vjust = 1, colour = "grey20") +
+    coord_cartesian(clip = "off") +
+    ggtitle(title_str) +
+    labs(x = NULL, y = "Cluster \u2014 Cell Identities") +
+    dotplot_theme
+}
+
+p_A <- make_dotplot(plot_obj, marker_panels_A,
+  "Marker gene expression \u2014 Follicular panels (res = 0.8)")
+print(p_A)
+ggsave(file.path(dotplot_dir, "DotPlot_res0.8_A_Follicular.png"),
+       p_A, width = 20, height = plot_height, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_res0.8_A_Follicular.svg"),
+       p_A, width = 20, height = plot_height, device = "svg")
+
+p_B <- make_dotplot(plot_obj, marker_panels_B,
+  "Marker gene expression \u2014 Non-follicular panels (res = 0.8)")
+print(p_B)
+ggsave(file.path(dotplot_dir, "DotPlot_res0.8_B_NonFollicular.png"),
+       p_B, width = 17, height = plot_height, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_res0.8_B_NonFollicular.svg"),
+       p_B, width = 17, height = plot_height, device = "svg")
+
+message("Dotplots res0.8 (A + B) saved to: ", dotplot_dir)
+```
+
+# Manual annotation of clusters
+Clusters annotated using DEG (FindAllMarkers, MG_score ranking), spatial
+expression in SpatialX, co-localisation with IF staining,
+clustree stability across resolutions, and published mouse ovarian scRNA-seq
+and spatial transcriptomic atlases.
+Final replot — annotated clusters (res = 0.8)
+```{r final-annotation}
+# Remove artefact clusters (low bin count, technical)
+artefact_clusters <- c("38", "39", "40", "41", "42")
+merge.full$cluster_working_clean <- as.character(merge.full$cluster_working)
+merge.full$cluster_working_clean[
+  merge.full$cluster_working_clean %in% artefact_clusters] <- NA
+
+table(merge.full$cluster_working,       useNA = "ifany")
+table(merge.full$cluster_working_clean, useNA = "ifany")
+Idents(merge.full) <- "cluster_working_clean"
+
+# =============================================================================
+# Final validated cluster annotations
+# =============================================================================
+cluster_annotation <- c(
+  # --- Follicle (GC + Oocyte) ---
+  "14" = "GC_Preantral",
+  "11" = "GC_Mural_Antral_1",
+  "34" = "GC_Mural_Antral_2",
+  "23" = "GC_Mitotic_Antral_1",
+  "30" = "GC_Mitotic_Antral_2",
+  "28" = "GC_Atretic_Early",
+  "19" = "GC_Atretic_Mid",
+  "32" = "GC_Atretic_Late",
+  "22" = "Oocyte_Primordial",
+  "26" = "Oocyte",
+  # --- CL ---
+  "7"  = "Luteal_Parm1pos_Starlow_CL_Early",
+  "13" = "Stromal_Col1a1high_CL_Early_1",
+  "37" = "Stromal_Sgk1high_CL_Early_2",
+  "33" = "Neutrophil_LutealInterface",
+  "5"  = "Luteal_Parm1low_Starhigh_CL_Mid",
+  "15" = "Luteal_Endo_Parm1low_CL_Mid",
+  "1"  = "Luteal_CL_Late_Inner",
+  "3"  = "Luteal_CL_Late_Outer",
+  "27" = "Luteal_Cdkn1apos_CL_Regressing",
+  # --- Theca + Stroma ---
+  "21" = "Theca_Lhcgrpos_Steroidogenic_Preantral",
+  "35" = "Theca_Proliferating_Preantral",
+  "8"  = "Theca_Ptch1pos_Steroidogenic_Antral",
+  "18" = "Stromal_Theca_Perifollicular_Atretic",
+  "0"  = "Stromal_Cyp17a1neg",
+  "2"  = "Stromal_Theca_Cyp17a1pos",
+  "12" = "Stromal_Prss35pos_Remodelling",
+  "36" = "Stromal_Col1a1pos_A7only",
+  "6"  = "Stromal_Fospos_Junpos",
+  # --- Immune + OSE ---
+  "17" = "Immune_TLS_Stroma",
+  "9"  = "Macrophage_Acta2pos",
+  "25" = "Macrophage_Ptgfrhigh",
+  "24" = "Macrophage_Stc1high_Stroma_CA04",
+  "29" = "Neutrophil",
+  "31" = "Immune_all-other",
+  "16" = "OSE",
+  # --- Vascular ---
+  "4"  = "SMC_Endo_Lyve1pos_Stroma",
+  "10" = "Endo_Pericyte_Acta2pos_Vascular",
+  "20" = "SMC_Stroma"
+)
+
+merge.full$annot_cluster <- unname(
+  cluster_annotation[as.character(merge.full$cluster_working_clean)])
+table(merge.full$annot_cluster, useNA = "ifany")
+
+# =============================================================================
+# Tissue compartment metadata
+# F  = Follicle (GC, Oocyte, Theca, Stromal_Theca_Perifollicular_Atretic)
+# CL = Corpus luteum
+# S  = Stroma + OSE
+# V  = Vascular + Immune
+# =============================================================================
+compartment_map_metadata <- c(
+  # F (14 clusters)
+  "Oocyte_Primordial"                        = "F",
+  "Oocyte"                                   = "F",
+  "GC_Preantral"                             = "F",
+  "GC_Mural_Antral_1"                        = "F",
+  "GC_Mural_Antral_2"                        = "F",
+  "GC_Mitotic_Antral_1"                      = "F",
+  "GC_Mitotic_Antral_2"                      = "F",
+  "GC_Atretic_Early"                         = "F",
+  "GC_Atretic_Mid"                           = "F",
+  "GC_Atretic_Late"                          = "F",
+  "Theca_Lhcgrpos_Steroidogenic_Preantral"   = "F",
+  "Theca_Proliferating_Preantral"            = "F",
+  "Theca_Ptch1pos_Steroidogenic_Antral"      = "F",
+  "Stromal_Theca_Perifollicular_Atretic"     = "F",
+  # CL (9 clusters)
+  "Luteal_Parm1pos_Starlow_CL_Early"         = "CL",
+  "Stromal_Col1a1high_CL_Early_1"            = "CL",
+  "Stromal_Sgk1high_CL_Early_2"             = "CL",
+  "Neutrophil_LutealInterface"               = "CL",
+  "Luteal_Parm1low_Starhigh_CL_Mid"         = "CL",
+  "Luteal_Endo_Parm1low_CL_Mid"             = "CL",
+  "Luteal_CL_Late_Inner"                    = "CL",
+  "Luteal_CL_Late_Outer"                    = "CL",
+  "Luteal_Cdkn1apos_CL_Regressing"          = "CL",
+  # S — Stroma + OSE (6 clusters)
+  "Stromal_Cyp17a1neg"                      = "S",
+  "Stromal_Theca_Cyp17a1pos"               = "S",
+  "Stromal_Prss35pos_Remodelling"           = "S",
+  "Stromal_Col1a1pos_A7only"               = "S",
+  "Stromal_Fospos_Junpos"                   = "S",
+  "OSE"                                     = "S",
+  # V — Vascular + Immune (9 clusters)
+  "Immune_TLS_Stroma"                       = "V",
+  "Macrophage_Acta2pos"                     = "V",
+  "Macrophage_Ptgfrhigh"                    = "V",
+  "Macrophage_Stc1high_Stroma_CA04"         = "V",
+  "Neutrophil"                              = "V",
+  "Immune_all-other"                        = "V",
+  "SMC_Endo_Lyve1pos_Stroma"               = "V",
+  "Endo_Pericyte_Acta2pos_Vascular"        = "V",
+  "SMC_Stroma"                              = "V"
+)
+
+merge.full$tissue_compartment <- unname(compartment_map_metadata[merge.full$annot_cluster])
+message("Tissue compartment bin counts:")
+print(table(merge.full$tissue_compartment, useNA = "ifany"))
+
+# =============================================================================
+# Factor level order for legend, dotplot Y-axis, and spatial map
+# Visual grouping: GC/Oocyte | CL | Theca/Stroma | Immune+OSE | Vascular
+# NOTE: this display order is independent of tissue_compartment metadata labels
+# =============================================================================
+annot_levels <- c(
+  # Follicle — GC and Oocyte
+  "GC_Preantral",
+  "GC_Mural_Antral_1", "GC_Mural_Antral_2",
+  "GC_Mitotic_Antral_1", "GC_Mitotic_Antral_2",
+  "GC_Atretic_Early", "GC_Atretic_Mid", "GC_Atretic_Late",
+  "Oocyte_Primordial", "Oocyte",
+  # CL
+  "Luteal_Parm1pos_Starlow_CL_Early",
+  "Stromal_Col1a1high_CL_Early_1", "Stromal_Sgk1high_CL_Early_2",
+  "Neutrophil_LutealInterface",
+  "Luteal_Parm1low_Starhigh_CL_Mid", "Luteal_Endo_Parm1low_CL_Mid",
+  "Luteal_CL_Late_Inner", "Luteal_CL_Late_Outer",
+  "Luteal_Cdkn1apos_CL_Regressing",
+  # Theca + Stroma (visual grouping)
+  "Theca_Lhcgrpos_Steroidogenic_Preantral",
+  "Theca_Proliferating_Preantral",
+  "Theca_Ptch1pos_Steroidogenic_Antral",
+  "Stromal_Theca_Perifollicular_Atretic",
+  "Stromal_Cyp17a1neg", "Stromal_Theca_Cyp17a1pos",
+  "Stromal_Prss35pos_Remodelling",
+  "Stromal_Col1a1pos_A7only", "Stromal_Fospos_Junpos",
+  # Immune + OSE
+  "Immune_TLS_Stroma",
+  "Macrophage_Acta2pos", "Macrophage_Ptgfrhigh",
+  "Macrophage_Stc1high_Stroma_CA04",
+  "Neutrophil", "Immune_all-other", "OSE",
+  # Vascular
+  "SMC_Endo_Lyve1pos_Stroma",
+  "Endo_Pericyte_Acta2pos_Vascular",
+  "SMC_Stroma"
+)
+stopifnot(length(annot_levels) == 38)
+
+# =============================================================================
+# Fixed cluster colour palette
+# =============================================================================
+annot_cluster_cols <- c(
+  "GC_Preantral"                             = "#3759ce",
+  "GC_Mural_Antral_1"                        = "#2ea597",
+  "GC_Mural_Antral_2"                        = "#045b52",
+  "GC_Mitotic_Antral_1"                      = "#1b2b88",
+  "GC_Mitotic_Antral_2"                      = "#6b40b2",
+  "GC_Atretic_Early"                         = "#4066df",
+  "GC_Atretic_Mid"                           = "#273ea5",
+  "GC_Atretic_Late"                          = "#2c46b1",
+  "Oocyte_Primordial"                        = "#7e3103",
+  "Oocyte"                                   = "#9469d6",
+  "Luteal_Parm1pos_Starlow_CL_Early"         = "#5978e3",
+  "Stromal_Col1a1high_CL_Early_1"            = "#e07941",
+  "Stromal_Sgk1high_CL_Early_2"             = "#1f3191",
+  "Neutrophil_LutealInterface"               = "#81143b",
+  "Luteal_Parm1low_Starhigh_CL_Mid"         = "#a783e1",
+  "Luteal_Endo_Parm1low_CL_Mid"             = "#962249",
+  "Luteal_CL_Late_Inner"                    = "#780d35",
+  "Luteal_CL_Late_Outer"                    = "#da7596",
+  "Luteal_Cdkn1apos_CL_Regressing"          = "#602400",
+  "Theca_Lhcgrpos_Steroidogenic_Preantral"  = "#4a238b",
+  "Theca_Proliferating_Preantral"           = "#512994",
+  "Theca_Ptch1pos_Steroidogenic_Antral"     = "#b1325c",
+  "Stromal_Theca_Perifollicular_Atretic"    = "#a84401",
+  "Stromal_Cyp17a1neg"                      = "#688ae8",
+  "Stromal_Theca_Cyp17a1pos"               = "#0d7d70",
+  "Stromal_Prss35pos_Remodelling"           = "#8456ce",
+  "Stromal_Col1a1pos_A7only"               = "#8a3603",
+  "Stromal_Fospos_Junpos"                   = "#692801",
+  "Immune_TLS_Stroma"                       = "#6237a7",
+  "Macrophage_Acta2pos"                     = "#1c8e81",
+  "Macrophage_Ptgfrhigh"                    = "#003e38",
+  "Macrophage_Stc1high_Stroma_CA04"         = "#ce567c",
+  "Neutrophil"                              = "#a32952",
+  "Immune_all-other"                        = "#bc4d01",
+  "OSE"                                     = "#096f64",
+  "SMC_Endo_Lyve1pos_Stroma"               = "#01443e",
+  "Endo_Pericyte_Acta2pos_Vascular"        = "#c33d69",
+  "SMC_Stroma"                              = "#03524a"
+)
+
+stopifnot(all(annot_levels %in% names(annot_cluster_cols)))
+message("Colour palette check passed: all 38 clusters have assigned colours.")
+
+
+# =============================================================================
+# UMAP — annotated clusters
+# =============================================================================
+merge_umap <- subset(merge.full,
+  cells = colnames(merge.full)[!is.na(merge.full$annot_cluster)])
+
+present_annots     <- unique(na.omit(as.character(merge_umap$annot_cluster)))
+ordered_annots     <- annot_levels[annot_levels %in% present_annots]
+remaining_annots   <- setdiff(present_annots, ordered_annots)
+final_annot_levels <- c(ordered_annots, remaining_annots)
+
+merge_umap$annot_cluster_plot <- factor(as.character(merge_umap$annot_cluster),
+                                        levels = final_annot_levels)
+Idents(merge_umap) <- "annot_cluster_plot"
+
+p_umap_annot <- DimPlot(merge_umap, reduction = "umap.harmony_banksy",
+   group.by = "annot_cluster_plot",
+   cols     = annot_cluster_cols[levels(merge_umap$annot_cluster_plot)],
+   label = FALSE, pt.size = 0.03, raster = FALSE) +
+   ggtitle("UMAP of Annotated Clusters") +
+   labs(x = "UMAP_1", y = "UMAP_2") +
+   guides(color = guide_legend(ncol = 1,
+                                override.aes = list(size = 6),
+                                keyheight    = unit(0.7, "cm"))) +
+   theme(text         = element_text(family = "Arial"),
+         plot.title   = element_text(hjust = 0.5, size = 20, face = "bold"),
+         legend.title = element_blank(),
+         legend.text  = element_text(size = 13),
+         axis.title.x = element_text(size = 16, face = "bold"),
+         axis.title.y = element_text(size = 16, face = "bold"),
+         axis.text.x  = element_text(size = 15),
+         axis.text.y  = element_text(size = 15),
+         axis.ticks        = element_line(linewidth = 0.6),
+         axis.ticks.length = unit(0.2, "cm"))
+
+ggsave("UMAP_HarmonyBANKSY_annotated.png",
+       p_umap_annot, width = 15, height = 12, dpi = 600)
+ggsave("UMAP_HarmonyBANKSY_annotated.tiff",
+       p_umap_annot, width = 15, height = 12, dpi = 600, device = "tiff")
+ggsave("UMAP_HarmonyBANKSY_annotated.svg",
+       rasterise(p_umap_annot, dpi = 300, dev = "ragg_png"),
+       width = 15, height = 12, device = "svg")
+
+# =============================================================================
+# Annotated dotplots — four biological panels
+# Visual grouping below is for dotplot display only and is independent of
+# the tissue_compartment metadata labels (F / CL / S / V)
+# =============================================================================
+annot_plot <- subset(merge.full,
+  cells = colnames(merge.full)[!is.na(merge.full$annot_cluster)])
+
+annot_plot$annot_cluster_plot <- factor(as.character(annot_plot$annot_cluster),
+                                        levels = final_annot_levels)
+Idents(annot_plot) <- "annot_cluster_plot"
+
+# Marker panels for each annotated dotplot
+marker_panels_Follicle_OSE <- list(
+  GC_broad     = c("Inha", "Gja1", "Foxl2", "Amh"),
+  GC_preantral = c("Kctd14", "Rgs2", "Amhr2"),
+  GC_antral    = c("Inhbb", "Serpine2", "Nap1l5"),
+  GC_mitotic   = c("Top2a", "Ccnd2", "Mki67", "Ccna2"),
+  GC_atretic   = c("Foxo1", "Ghr", "Pik3ip1", "Ivns1abp"),
+  Oocyte       = c("Ooep", "Zp3", "Nlrp14"),
+  OSE          = c("Krt19", "Upk3b", "Epcam"))
+
+marker_panels_Luteal <- list(
+  Luteal            = c("Cyp11a1", "Hsd3b1", "Fdx1", "Star"),
+  Luteal_early      = c("Lhcgr", "Prlr", "Parm1"),
+  Luteal_late       = c("Akr1c18", "S100a6", "Onecut2"),
+  Luteal_regressing = c("Ptgfr", "Cdkn1a", "Sdc4"))
+
+marker_panels_Theca_Stroma <- list(
+  Stroma = c("Dcn", "Vim", "Col1a1", "Pdgfra"),
+  Theca  = c("Aldh1a1", "Cyp17a1", "Mgarp"))
+
+marker_panels_Vasc_Immune <- list(
+  Immune_mac    = c("Ptprc", "Cd68", "C1qa", "Mrc1"),
+  Immune_lympho = c("Cd79a", "Ms4a1"),
+  SMC           = c("Tagln", "Acta2", "Myh11"),
+  Pericyte      = c("Pdgfrb", "Rgs5"),
+  Endo_vasc     = c("Cldn5", "Pecam1", "Flt1"),
+  Endo_lymph    = c("Ccl21a", "Lyve1", "Prox1"))
+
+# Cluster subsets for each dotplot
+clusters_Follicle_OSE <- c(
+  "GC_Preantral",
+  "GC_Mural_Antral_1", "GC_Mural_Antral_2",
+  "GC_Mitotic_Antral_1", "GC_Mitotic_Antral_2",
+  "GC_Atretic_Early", "GC_Atretic_Mid", "GC_Atretic_Late",
+  "Oocyte_Primordial", "Oocyte",
+  "OSE")
+
+clusters_Luteal <- c(
+  "Luteal_Parm1pos_Starlow_CL_Early",
+  "Stromal_Col1a1high_CL_Early_1", "Stromal_Sgk1high_CL_Early_2",
+  "Neutrophil_LutealInterface",
+  "Luteal_Parm1low_Starhigh_CL_Mid", "Luteal_Endo_Parm1low_CL_Mid",
+  "Luteal_CL_Late_Inner", "Luteal_CL_Late_Outer",
+  "Luteal_Cdkn1apos_CL_Regressing")
+
+clusters_Theca_Stroma <- c(
+  "Theca_Lhcgrpos_Steroidogenic_Preantral",
+  "Theca_Proliferating_Preantral",
+  "Theca_Ptch1pos_Steroidogenic_Antral",
+  "Stromal_Theca_Perifollicular_Atretic",
+  "Stromal_Cyp17a1neg",
+  "Stromal_Theca_Cyp17a1pos",
+  "Stromal_Prss35pos_Remodelling",
+  "Stromal_Col1a1pos_A7only",
+  "Stromal_Fospos_Junpos")
+
+clusters_Vasc_Immune <- c(
+  "Immune_TLS_Stroma",
+  "Macrophage_Acta2pos",
+  "Macrophage_Ptgfrhigh",
+  "Macrophage_Stc1high_Stroma_CA04",
+  "Neutrophil",
+  "Immune_all-other",
+  "SMC_Stroma",
+  "SMC_Endo_Lyve1pos_Stroma",
+  "Endo_Pericyte_Acta2pos_Vascular")
+
+# Subset objects for each dotplot
+annot_plot_Follicle_OSE <- subset(annot_plot, idents = clusters_Follicle_OSE)
+annot_plot_Luteal       <- subset(annot_plot, idents = clusters_Luteal)
+annot_plot_Theca_Stroma <- subset(annot_plot, idents = clusters_Theca_Stroma)
+annot_plot_Vasc_Immune  <- subset(annot_plot, idents = clusters_Vasc_Immune)
+
+get_dotplot_height <- function(n_clusters) max(4.8, 0.2 * n_clusters)
+h_follicle <- get_dotplot_height(length(clusters_Follicle_OSE))
+h_luteal   <- get_dotplot_height(length(clusters_Luteal))
+h_theca    <- get_dotplot_height(length(clusters_Theca_Stroma))
+h_vasc     <- get_dotplot_height(length(clusters_Vasc_Immune))
+
+dotplot_theme_annot <- theme_bw(base_size = 12, base_family = "Arial") +
+  theme(
+    plot.title         = element_text(size = 11, face = "bold", hjust = 0.5),
+    axis.title.y       = element_text(size = 11),
+    axis.title.x       = element_blank(),
+    axis.text.y        = element_text(size = 9),
+    axis.text.x        = element_text(size = 9, angle = 90, hjust = 1, vjust = 0.5),
+    axis.ticks.x       = element_blank(),
+    legend.title       = element_text(size = 11),
+    legend.text        = element_text(size = 9),
+    legend.key.size    = unit(0.5, "cm"),
+    legend.key.height  = unit(0.5, "cm"),
+    legend.key.width   = unit(0.6, "cm"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.border       = element_rect(colour = "black", fill = NA, linewidth = 0.4))
+
+make_annot_dotplot <- function(obj, panels, title_str) {
+  genes_use <- unique(unlist(panels, use.names = FALSE))
+  genes_use <- genes_use[genes_use %in% rownames(obj)]
+  layout    <- make_marker_layout(panels, genes_use)
+  DotPlot(obj, features = genes_use, group.by = "annot_cluster_plot",
+          col.min = 0, col.max = 2.5, dot.scale = 6,
+          cluster.idents = FALSE, cols = c("#DBCADB", "#300036")) +
+    RotatedAxis() +
+    ggplot2::geom_vline(xintercept = layout$vline_pos,
+                        linewidth = 0.45, alpha = 0.8, colour = "grey55") +
+    ggplot2::annotate("text",
+                      x = layout$label_df$x, y = -0.05,
+                      label = layout$label_df$subgroup,
+                      size = 3.0, vjust = -1.0, colour = "grey20") +
+    scale_y_discrete(expand = expansion(mult = c(0.00, 0.05))) +
+    coord_cartesian(clip = "off") +
+    ggtitle(title_str) +
+    labs(x = NULL, y = "Annotated clusters") +
+    dotplot_theme_annot
+}
+
+dot_annot_Follicle_OSE <- make_annot_dotplot(
+  annot_plot_Follicle_OSE, marker_panels_Follicle_OSE,
+  "Follicular and OSE markers")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Follicle_OSE.png"),
+       dot_annot_Follicle_OSE, width = 10, height = h_follicle, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Follicle_OSE.tiff"),
+       dot_annot_Follicle_OSE, width = 10, height = h_follicle, device = "tiff")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Follicle_OSE.svg"),
+       rasterise(dot_annot_Follicle_OSE, dpi = 300, dev = "ragg_png"),
+       width = 10, height = h_follicle, device = "svg")
+
+dot_annot_Luteal <- make_annot_dotplot(
+  annot_plot_Luteal, marker_panels_Luteal,
+  "Luteal markers")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Luteal.png"),
+       dot_annot_Luteal, width = 10, height = h_luteal, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Luteal.tiff"),
+       dot_annot_Luteal, width = 10, height = h_luteal, device = "tiff")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Luteal.svg"),
+       rasterise(dot_annot_Luteal, dpi = 300, dev = "ragg_png"),
+       width = 10, height = h_luteal, device = "svg")
+
+dot_annot_Theca_Stroma <- make_annot_dotplot(
+  annot_plot_Theca_Stroma, marker_panels_Theca_Stroma,
+  "Theca and stromal markers")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Theca_Stroma.png"),
+       dot_annot_Theca_Stroma, width = 10, height = h_theca, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Theca_Stroma.tiff"),
+       dot_annot_Theca_Stroma, width = 10, height = h_theca, device = "tiff")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Theca_Stroma.svg"),
+       rasterise(dot_annot_Theca_Stroma, dpi = 300, dev = "ragg_png"),
+       width = 10, height = h_theca, device = "svg")
+
+dot_annot_Vasc_Immune <- make_annot_dotplot(
+  annot_plot_Vasc_Immune, marker_panels_Vasc_Immune,
+  "Vascular and immune markers")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Vasc_Immune.png"),
+       dot_annot_Vasc_Immune, width = 10, height = h_vasc, dpi = 600)
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Vasc_Immune.tiff"),
+       dot_annot_Vasc_Immune, width = 10, height = h_vasc, device = "tiff")
+ggsave(file.path(dotplot_dir, "DotPlot_annotated_Vasc_Immune.svg"),
+       rasterise(dot_annot_Vasc_Immune, dpi = 300, dev = "ragg_png"),
+       width = 10, height = h_vasc, device = "svg")
+
+
+# =============================================================================
+# Annotated spatial map
+# =============================================================================
+annot_df <- merge.full[[]] %>%
+  tibble::rownames_to_column("barcode_full") %>%
+  dplyr::transmute(barcode_full, samples,
+                   annot_cluster = as.character(annot_cluster))
+
+cluster_coords_annot <- mapping_df_4 %>%
+  dplyr::filter(barcode_full %in% colnames(merge.full)) %>%
+  dplyr::left_join(annot_df, by = c("barcode_full", "samples"))
+
+cluster_coords_annot_sel <- cluster_coords_annot %>%
+  dplyr::filter(!is.na(annot_cluster)) %>%
+  dplyr::mutate(annot_cluster = factor(annot_cluster, levels = final_annot_levels))
+
+levs_annot <- levels(cluster_coords_annot_sel$annot_cluster)
+
+p_spatial_annot <- ggplot() +
+  rasterise(geom_point(data  = cluster_coords_annot,
+                       aes(x = array_col, y = -array_row),
+                       shape = ".", color = "#d3d3d3"),
+            dpi = 600, dev = "ragg_png") +
+  rasterise(geom_point(data  = cluster_coords_annot_sel,
+                       aes(x = array_col, y = -array_row,
+                           color = annot_cluster),
+                       shape = "."),
+            dpi = 600, dev = "ragg_png") +
+  scale_color_manual(values = annot_cluster_cols[levs_annot],
+                     breaks = levs_annot) +
+  coord_fixed() +
+  theme_linedraw() +
+  facet_wrap(~samples, ncol = 2) +
+  guides(color = guide_legend(override.aes = list(shape = 16, size = 7),
+                               ncol = 1,
+                               keyheight = unit(0.8, "cm"))) +
+  ggtitle("Spatial Expression of Annotated Clusters") +
+  theme(text             = element_text(family = "Arial"),
+        panel.grid       = element_blank(),
+        axis.title       = element_blank(),
+        axis.text        = element_blank(),
+        axis.ticks       = element_blank(),
+        strip.background = element_rect(fill = NA, color = NA),
+        plot.title       = element_text(hjust = 0.5, size = 22, face = "bold"),
+        strip.text       = element_text(size = 14, face = "bold"),
+        legend.text      = element_text(size = 14),
+        legend.title     = element_blank(),
+        legend.key.width = unit(1.0, "cm"),
+        panel.background = element_rect(fill = "transparent", colour = NA),
+        plot.background  = element_rect(fill = "transparent", colour = NA))
+
+ggsave("Spatial_HarmonyBANKSY_annotated.png",
+       p_spatial_annot, width = 16, height = 14, dpi = 600,
+       bg = "transparent")
+ggsave("Spatial_HarmonyBANKSY_annotated.tiff",
+       p_spatial_annot, width = 16, height = 14, device = "tiff",
+       bg = "transparent")
+ggsave("Spatial_HarmonyBANKSY_annotated.svg",
+       rasterise(p_spatial_annot, dpi = 300, dev = "ragg_png"),
+       width = 16, height = 14, device = "svg", bg = "transparent")
+
+# =============================================================================
+# Save annotated RDS for script 10 (DEG/GSEA)
+# annot_cluster and tissue_compartment are now embedded in merge.full metadata
+# =============================================================================
+saveRDS(merge.full,
+        file = "Z:/Visium_Data/01_Multi-sample-integration/merge_full_HarmonyBANKSY_SeuratClusters_annotated.rds")
+
+message("Final annotated plots complete.")
+message("RDS saved: merge_full_HarmonyBANKSY_SeuratClusters_annotated.rds")
+```
