@@ -2,6 +2,7 @@
 
 **Linking local tissue stiffness to the molecular state of the same tissue region.**
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22825608.svg)](https://doi.org/10.5281/zenodo.22825608)
 ---
 
 ## The question
@@ -144,6 +145,8 @@ derived tables are available as described in the associated publication.
 
 This release is archived with a DOI. Please cite the DOI rather than the repository
 URL, so the citation points at this exact version of the code.
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22825608.svg)](https://doi.org/10.5281/zenodo.22825608)
 
 ## Licence
 
