@@ -136,9 +136,9 @@ Random seeds are fixed throughout.
 
 ## Data
 
-Spatial transcriptomics data are deposited in GEO under accession **[GSE346700]**.
-Mechanical data, registration images and derived tables are available as described in
-the associated publication.
+Spatial transcriptomics data are deposited in GEO under accession GSE346700,
+currently private pending publication. Mechanical data, registration images and
+derived tables are available as described in the associated publication.
 
 ## Citing this code
 
