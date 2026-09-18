@@ -804,6 +804,35 @@ def shades_for(comp, nums):
     return generate_shades(BASE_COLOURS[comp], len(nums))
 
 
+def feature_items(sub, comp, num_col="_n"):
+    """
+    [(num, colour, label, rows)] for one compartment, drawing order first to
+    last.
+
+    A ROI-Segmentation label with a trailing number ("Y1-F-3") is one numbered
+    feature and keeps its shade from the ramp. A label WITHOUT a number
+    ("Y4-F", "Y4-CL") is a whole compartment lumped into a single annotation
+    object: it has no feature number, so it cannot be shaded, and it is
+    returned as ONE group in the compartment's base colour, labelled "F" / "CL"
+    with no digit.
+
+    This function exists because every earlier version iterated
+    zip(sorted(nums), shades) directly. With unnumbered labels that list is
+    empty, the loop body never runs, and F and CL vanish from the plot without
+    an error.
+    """
+    if num_col not in sub.columns:
+        sub = sub.copy()
+        sub[num_col] = sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
+    nums = sorted(int(n) for n in sub[num_col].dropna().unique())
+    items = [(n, col, f"{comp}{n}", sub[sub[num_col] == n])
+             for n, col in zip(nums, shades_for(comp, nums))]
+    unnum = sub[sub[num_col].isna()]
+    if len(unnum):
+        items.append((None, BASE_COLOURS[comp], comp, unnum))
+    return items
+
+
 def marker_s(x_range, y_range):
     """Placeholder. The real size is set by fit_bin_markers() at save time."""
     return 1.0
@@ -1284,16 +1313,13 @@ def plot_single_compartment(tissue_df, tissue_id, comp,
         handles.append(patch(base, comp))
     else:
         sub["_n"] = sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
-        nums   = sorted(sub["_n"].dropna().unique())
-        shades = shades_for(comp, nums)
         halo_z = 4 if HALO_ON_TOP else 2
-        for num, col in zip(nums, shades):
-            rows = sub[sub["_n"] == num]
+        for num, col, label, rows in feature_items(sub, comp):
             if comp in HALO_COMPARTMENTS:
                 halo(ax, rows[COL_X].values, rows[COL_Y].values,
                      halo_colour(base), halo_z)
             scatter_sq(ax, rows[COL_X].values, rows[COL_Y].values, col, s)
-            handles.append(patch(col, f"{comp}{int(num)}"))
+            handles.append(patch(col, label))
 
     apply_style(ax, xlim, ylim, f"{tissue_id}  ·  {comp}", handles)
     save_all(fig, f"{tissue_id}-{comp}",
@@ -1322,17 +1348,14 @@ def plot_tissue_combined(tissue_df, tissue_id, xlim, ylim, s):
             handles.append(patch(base, comp))
         else:
             sub["_n"] = sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
-            nums   = sorted(sub["_n"].dropna().unique())
-            shades = shades_for(comp, nums)
             halo_z = 4 if HALO_ON_TOP else 2
-            for num, col in zip(nums, shades):
-                rows = sub[sub["_n"] == num]
+            for num, col, label, rows in feature_items(sub, comp):
                 if comp in HALO_COMPARTMENTS:
                     halo(ax, rows[COL_X].values, rows[COL_Y].values,
                      halo_colour(base), halo_z)
                 scatter_sq(ax, rows[COL_X].values, rows[COL_Y].values,
                            col, s)
-                handles.append(patch(col, f"{comp}{int(num)}"))
+                handles.append(patch(col, label))
 
     apply_style(ax, xlim, ylim, f"{tissue_id}  ·  ROI Segmentation", handles)
     save_all(fig, f"{tissue_id}-ROI-Segmentation",
@@ -1375,10 +1398,10 @@ def plot_tissue_flat(tissue_df, tissue_id, xlim, ylim, s):
             continue
         base = BASE_COLOURS[comp]
         if FLAT_ROI_HALOS and comp in HALO_COMPARTMENTS:
-            # still per feature, otherwise adjacent follicles merge into one blob
-            for num in sorted(sub[COL_SEG].apply(
-                    lambda v: parse_seg(v)[2]).dropna().unique()):
-                rows = sub[sub[COL_SEG].apply(lambda v: parse_seg(v)[2]) == num]
+            # still per feature, otherwise adjacent follicles merge into one
+            # blob. Unnumbered labels come back as one group, so the outline
+            # is around the merged compartment rather than around each object.
+            for _num, _col, _label, rows in feature_items(sub, comp):
                 halo(ax, rows[COL_X].values, rows[COL_Y].values,
                      halo_colour(base), halo_z)
         scatter_sq(ax, sub[COL_X].values, sub[COL_Y].values, base, s)
@@ -1413,18 +1436,17 @@ def plot_compartment_only(tissue_df, tissue_id, comp, xlim, ylim, s):
     if sub.empty:
         return
 
+    items = []
     if comp not in ("S", "V"):
         sub["_n"] = sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
-        nums   = sorted(sub["_n"].dropna().unique())
-        shades = shades_for(comp, nums)
+        items = feature_items(sub, comp)
     halo_z = 4 if HALO_ON_TOP else 2
 
     def draw(ax):
         if comp in ("S", "V"):
             scatter_sq(ax, sub[COL_X].values, sub[COL_Y].values, base, s)
             return
-        for num, col in zip(nums, shades):
-            rows = sub[sub["_n"] == num]
+        for num, col, label, rows in items:
             if comp in HALO_COMPARTMENTS:
                 halo(ax, rows[COL_X].values, rows[COL_Y].values,
                      halo_colour(base), halo_z)
@@ -1452,16 +1474,23 @@ def plot_individual_features(tissue_df, tissue_id, comp, xlim, ylim, s):
         return
 
     sub["_n"] = sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
-    nums   = sorted(sub["_n"].dropna().unique())
-    if not nums:
+    # The unnumbered group is dropped HERE only. Its content is byte-identical
+    # to <ID>_<comp>only, and under ORGANISE_OUTPUT = False both would be
+    # written to the same stem in the same folder, so one would overwrite the
+    # other. Every other plot still draws it.
+    items = [it for it in feature_items(sub, comp) if it[0] is not None]
+    if not items:
+        n_un = int(sub["_n"].isna().sum())
+        if n_un:
+            print(f"    {tissue_id}-{comp}: {n_un:,} bins carry an unnumbered "
+                  f"label, so there are no per-feature layers; the whole "
+                  f"compartment is in {tissue_id}_{comp}only")
         return
-    shades = shades_for(comp, nums)
     halo_z = 4 if HALO_ON_TOP else 2
     fdir = out_dir_for(tissue_id, "features", "feature")
     bg = grey_bg_frame(tissue_df) if GREY_BG_ON_FEATURE_LAYERS else None
 
-    for num, col in zip(nums, shades):
-        rows = sub[sub["_n"] == num]
+    for num, col, label, rows in items:
         if rows.empty:
             continue
 
@@ -1472,8 +1501,8 @@ def plot_individual_features(tissue_df, tissue_id, comp, xlim, ylim, s):
                  halo_colour(base), halo_z)
         scatter_sq(ax, rows[COL_X].values, rows[COL_Y].values, col, s)
         apply_style_bare(ax, xlim, ylim,
-                         f"{tissue_id}  ·  {comp}{int(num)}")
-        save_png_svg(fig, f"{tissue_id}-{comp}{int(num)}", out_dir=fdir)
+                         f"{tissue_id}  ·  {label}")
+        save_png_svg(fig, f"{tissue_id}-{label}", out_dir=fdir)
 
         # halo alone, same canvas and limits so it registers on the above
         if EXPORT_INDIVIDUAL_HALOS and comp in HALO_COMPARTMENTS:
@@ -1482,13 +1511,13 @@ def plot_individual_features(tissue_df, tissue_id, comp, xlim, ylim, s):
                          halo_colour(base), halo_z)
             if not drawn:
                 plt.close(fig)
-                print(f"    skipped: {tissue_id}-{comp}{int(num)}_halo  "
+                print(f"    skipped: {tissue_id}-{label}_halo  "
                       f"(no halo drawn: {len(rows)} bins, "
                       f"HALO_MIN_BINS = {HALO_MIN_BINS})")
             else:
                 apply_style_bare(ax, xlim, ylim,
-                                 f"{tissue_id}  ·  {comp}{int(num)} halo")
-                save_png_svg(fig, f"{tissue_id}-{comp}{int(num)}_halo",
+                                 f"{tissue_id}  ·  {label} halo")
+                save_png_svg(fig, f"{tissue_id}-{label}_halo",
                              out_dir=fdir)
 
 
@@ -2272,12 +2301,11 @@ def plot_value_layers(tissue_df, tissue_id, value_col, suffix, cmap,
         if comp not in ("F", "CL"):
             continue
 
-        nums = sorted(sub[COL_SEG].apply(lambda v: parse_seg(v)[2])
-                      .dropna().unique())
-        for num in nums:
-            rows = sub[sub[COL_SEG].apply(
-                lambda v: parse_seg(v)[2]) == num]
-            if rows.empty:
+        # Unnumbered labels are skipped here for the same reason as in
+        # plot_individual_features: that layer already exists as
+        # <ID>_<comp>only_<suffix>, written just above.
+        for num, _col, label, rows in feature_items(sub, comp):
+            if num is None or rows.empty:
                 continue
             fig, ax = new_layer_fig(xlim, ylim, s, bg_df=bg_feat)
             n_val, n_na = scatter_val(ax, rows[COL_X].values,
@@ -2286,13 +2314,13 @@ def plot_value_layers(tissue_df, tissue_id, value_col, suffix, cmap,
                                       cmap, vmin, vmax, s)
             apply_style_bare(
                 ax, xlim, ylim,
-                f"{tissue_id}  ·  {comp}{int(num)}  ·  {suffix}")
+                f"{tissue_id}  ·  {label}  ·  {suffix}")
             if n_val == 0:
                 plt.close(fig)
-                print(f"    skipped: {tissue_id}-{comp}{int(num)}_{suffix}  "
+                print(f"    skipped: {tissue_id}-{label}_{suffix}  "
                       f"(no bins with a value; {n_na} bins have none)")
             else:
-                save_png_svg(fig, f"{tissue_id}-{comp}{int(num)}_{suffix}",
+                save_png_svg(fig, f"{tissue_id}-{label}_{suffix}",
                              out_dir=feat_dir, formats=fmts)
 
 
@@ -2765,6 +2793,14 @@ def _run():
     print(f"Assigned ROI-Segmentation labels ({len(seg_assigned)}):")
     for lab in sorted(seg_assigned):
         print(f"  {lab}")
+    unnumbered = sorted(v for v in seg_assigned
+                        if parse_seg(v)[1] in ("F", "CL")
+                        and parse_seg(v)[2] is None)
+    if unnumbered:
+        print(f"\n  [NOTE] {len(unnumbered)} F/CL label(s) carry no feature "
+              f"number: {unnumbered}")
+        print("         Each is drawn as ONE object in the compartment base "
+              "colour, with no shading and no per-feature layers.")
     print()
 
     # -------------------------------------------------------------------------

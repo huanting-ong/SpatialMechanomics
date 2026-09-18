@@ -92,6 +92,13 @@ ROI_COL = "ROIs"
 COL_X, COL_Y = "x", "y"
 
 MIN_BINS_PER_POINT = 5
+# Reference threshold only. The positive control assigns every point to its
+# plurality compartment and discards nothing, because discarding the points
+# that are hardest to classify would bias a control that asks whether stiffness
+# tracks architecture at all. The reported compartment analyses in the paper do
+# apply this threshold, so the run log prints both counts and the gap is
+# documented rather than silent.
+COMPARTMENT_MIN_FRAC = 0.50
 K_NEIGHBOURS = 4
 SCALE_FACTOR = 1e4
 
@@ -192,25 +199,38 @@ def build_points():
                 .reindex(range(len(uniq))).values)
 
     tgt = meta[TARGET_COL].values
-    pm = pd.DataFrame({
-        "point_id": uniq,
-        "n_bins": nb,
-        "target": np.bincount(inv, weights=tgt) / nb,
-        "x": np.bincount(inv, weights=meta[COL_X].values) / nb,
-        "y": np.bincount(inv, weights=meta[COL_Y].values) / nb,
-        "compartment": maj(COMPARTMENT_COL),
-        "cluster": maj(CLUSTER_COL),
-        "slice": maj(TISSUE_COL),
-        "roi": maj(ROI_COL),
-    })
-    pm["animal"] = pm["slice"].astype(str).str.replace(r"-\d+$", "", regex=True)
-    pm["age_group"] = np.where(pm["animal"].str.startswith("Y"), "young", "aged")
 
     # per-point composition fractions
     comp_frac = (pd.crosstab(inv, meta[COMPARTMENT_COL].astype(str), normalize="index")
                  .reindex(range(len(uniq))).fillna(0))
     clus_frac = (pd.crosstab(inv, meta[CLUSTER_COL].astype(str), normalize="index")
                  .reindex(range(len(uniq))).fillna(0))
+
+    # Compartment label by plurality, deliberately.
+    #
+    # A point that is 34% stroma, 33% vasculature and 33% corpus luteum is
+    # called stroma here, so no point is discarded. compartment_frac records
+    # how dominant that plurality was, and the run log reports how many points
+    # would have survived the 50% threshold the reported analyses use.
+    _comp_cols = [c for c in comp_frac.columns if c in {"F", "CL", "S", "V"}]
+    _sub = comp_frac[_comp_cols] if _comp_cols else comp_frac
+    _top_frac = _sub.max(axis=1).values
+    compartment = _sub.idxmax(axis=1).values
+
+    pm = pd.DataFrame({
+        "point_id": uniq,
+        "n_bins": nb,
+        "target": np.bincount(inv, weights=tgt) / nb,
+        "x": np.bincount(inv, weights=meta[COL_X].values) / nb,
+        "y": np.bincount(inv, weights=meta[COL_Y].values) / nb,
+        "compartment": compartment,
+        "compartment_frac": _top_frac,
+        "cluster": maj(CLUSTER_COL),
+        "slice": maj(TISSUE_COL),
+        "roi": maj(ROI_COL),
+    })
+    pm["animal"] = pm["slice"].astype(str).str.replace(r"-\d+$", "", regex=True)
+    pm["age_group"] = np.where(pm["animal"].str.startswith("Y"), "young", "aged")
 
     ok = nb >= MIN_BINS_PER_POINT
     return (agg[ok], pm.loc[ok].reset_index(drop=True), genes,
@@ -304,6 +324,11 @@ def main():
 
     comps = [c for c in ["F", "CL", "S", "V"] if (pm["compartment"] == c).any()]
     groups = [y[pm["compartment"].values == c] for c in comps]
+    n_above = int((pm["compartment_frac"].values >= COMPARTMENT_MIN_FRAC).sum())
+    print(f"  all {len(pm):,} points are assigned by plurality here. "
+          f"{n_above:,} of them also reach the {COMPARTMENT_MIN_FRAC:.0%} "
+          f"threshold used by the reported compartment analyses, so this "
+          f"control covers {len(pm) - n_above:,} point(s) that those exclude.")
     if len(groups) >= 2:
         H, p = kruskal(*groups)
         print(f"  Kruskal-Wallis across {len(comps)} compartments: "

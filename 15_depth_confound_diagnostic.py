@@ -28,10 +28,18 @@ What it computes
         conditioned on detection, and conditioned with nFeature partialled out
         of both variables. If the skew is a depth artefact, the partial
         version becomes roughly symmetric
-    C   The same per-gene rho after collapsing bins to nano_point_id. About 92
-        bins share one measurement, so bin-level n is not the number of
-        independent observations, which is why bin-level FDR values reach
-        1e-300
+    C   The same per-gene rho after collapsing bins to the nanoindentation
+        point. About 90 bins share one measurement, so bin-level n is not the
+        number of independent observations, which is why bin-level FDR values
+        reach 1e-300.
+        The point key is Tissue.slices + ROIs + nano_point_id, identical to
+        the correlation script. nano_point_id on its own is a grid index that
+        repeats in every ROI and every tissue, so grouping on it alone merges
+        points from different ovaries into a single pseudo-point.
+        Counts are summed over each point's bins and normalised ONCE per
+        point, as the correlation script does. Averaging the already
+        log-normalised bin values instead leaves the per-bin 1/N term in
+        place, which is the artefact this section exists to rule out.
     D   Reconstructs the bin-level mean expression metric and correlates it
         with nFeature, to show what that quantity actually measures
 
@@ -84,6 +92,15 @@ EXPRESSION_THRESH = 0.03      # same as script 12
 QC_THRESH = 0.05              # same as script 12
 NANO_ID_COL = "nano_point_id"
 COMPARTMENT_COL = "Compartments"
+
+# Composite key identifying one 50 um nanoindentation point.
+# Must match the correlation script exactly. nano_point_id alone is a
+# grid index and is NOT unique across ROIs or tissues.
+POINT_KEY_COLS = ["Tissue.slices", "ROIs", "nano_point_id"]
+
+# Normalisation constant for the point-level re-normalisation in section C.
+# Must match the correlation script.
+SCALE_FACTOR = 1e4
 
 N_GENES_TEST = 1500           # genes sampled for the per-gene comparison
 MIN_BINS_PER_POINT = 5        # same as script 12
@@ -202,6 +219,20 @@ def main():
     have_ncount = "nCount_RNA" in meta.columns
     n_count = meta["nCount_RNA"].values.astype(float) if have_ncount else None
 
+    # Raw counts, reconstructed by inverting LogNormalize. Needed only by
+    # section C, which must re-normalise once per point rather than average
+    # per-bin normalised values. Same reconstruction as the positive-control
+    # script.
+    counts = None
+    if have_ncount:
+        R = sparse.csr_matrix(X, copy=True)
+        R.data = np.expm1(R.data)
+        R.data *= np.repeat(n_count, np.diff(R.indptr))
+        _unit = R.data.min()
+        R.data = np.round(R.data / _unit)
+        R.eliminate_zeros()
+        counts = R
+
     if have_ncount:
         agree = spearmanr(n_count, n_feature)
         print(f"  nCount_RNA present. rho(nCount, nFeature) = {agree.correlation:+.3f}")
@@ -311,23 +342,47 @@ def main():
     print("C. SAME GENES AT NANOINDENTATION-POINT LEVEL")
     print("=" * 72)
 
-    if NANO_ID_COL not in meta.columns:
-        print("  no nano_point_id column, skipped")
+    key_cols = [c for c in POINT_KEY_COLS if c in meta.columns]
+    if not key_cols:
+        print(f"  none of {POINT_KEY_COLS} present, skipped")
+    elif NANO_ID_COL not in key_cols:
+        print(f"  no {NANO_ID_COL} column, skipped")
     else:
-        pid = meta[NANO_ID_COL].astype(str).values
+        # Composite key. Grouping on nano_point_id alone merges points that
+        # share a grid index across different ROIs and different ovaries.
+        pid = meta[key_cols].astype(str).agg("||".join, axis=1).values
         uniq, inv = np.unique(pid, return_inverse=True)
-        counts = np.bincount(inv).astype(float)
+        nbins = np.bincount(inv).astype(float)
         ind = sparse.csr_matrix(
             (np.ones(len(inv)), (inv, np.arange(len(inv)))),
             shape=(len(uniq), len(inv)))
-        agg = ind @ Xc
-        agg = sparse.csr_matrix(agg).multiply(1.0 / counts[:, None]).tocsc()
+        if counts is not None:
+            # Sum raw counts over the point's bins, then normalise once.
+            raw_sum = (ind @ counts[:, sel]).tocsr()
+            depth_pt = np.asarray(raw_sum.sum(axis=1)).ravel()
+            scale = np.where(depth_pt > 0,
+                             SCALE_FACTOR / np.maximum(depth_pt, 1.0), 0.0)
+            agg = sparse.csr_matrix(raw_sum.multiply(scale[:, None]))
+            agg.data = np.log1p(agg.data)
+            agg = agg.tocsc()
+            norm_note = "raw counts summed, normalised once per point"
+        else:
+            # Fallback only. This averages per-bin normalised values and
+            # therefore retains the 1/N term; treat the result as indicative.
+            agg = ind @ Xc
+            agg = sparse.csr_matrix(agg).multiply(1.0 / nbins[:, None]).tocsc()
+            norm_note = ("nCount_RNA absent, averaged per-bin normalised "
+                         "values (1/N term NOT removed)")
 
-        y_pt = np.bincount(inv, weights=y) / counts
-        ok = counts >= MIN_BINS_PER_POINT
-        print(f"  bins: {X.shape[0]:,}  ->  nano points: {ok.sum():,} "
+        y_pt = np.bincount(inv, weights=y) / nbins
+        ok = nbins >= MIN_BINS_PER_POINT
+        print(f"  point key: {' + '.join(key_cols)}")
+        print(f"    {len(uniq):,} points "
+              f"(vs {meta[NANO_ID_COL].nunique():,} on {NANO_ID_COL} alone)")
+        print(f"  bins: {X.shape[0]:,}  ->  nano points: {int(ok.sum()):,} "
               f"(>= {MIN_BINS_PER_POINT} bins each)")
-        print(f"  median bins per point: {np.median(counts):.0f}")
+        print(f"  median bins per retained point: {np.median(nbins[ok]):.0f}")
+        print(f"  normalisation: {norm_note}")
         print("  Bin-level n is NOT the number of independent observations.")
         print("  That is why bin-level FDR reaches 1e-300 and the y axis clips.")
 

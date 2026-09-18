@@ -68,6 +68,7 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 import sys
+import re as _re
 from datetime import datetime
 
 # =============================================================================
@@ -85,8 +86,9 @@ OUTPUT_CSV    = OUTPUT_DIR / "metadata_with_nano.tsv"
 # NI CSVs stay in 001_SpatialX — use absolute paths or relative to script
 NI_ROOT       = Path(r"Z:\Visium_Data\001_SpatialX")
 
-N_BINS_PER_BOX   = 100       # bins selected per grid cell (nearest to centroid)
+N_BINS_PER_BOX   = 140       # bins selected per grid cell (nearest to centroid)
 MIN_BINS_PER_BOX = 20        # cells below this are flagged low-confidence
+MAX_CENTROID_DIST_FRAC = 0.75
 VISCOSITY_MAX    = 1.0       # Ns/m cap for Maxwell fit failures
 
 # Grid indices are 1-based throughout the pipeline: the first indentation is
@@ -194,14 +196,10 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240920_13w-02-ms01-young-Y2",
         "corner_annotations": {
-            "Y2-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y2-1_BotR"    : {"nano_x": 7,   "nano_y": 1   },
-            "Y2-1_TopL"    : {"nano_x": 1,    "nano_y": 13  },
-            "Y2-1_TopR"    : {"nano_x": 7,   "nano_y": 13  },
-            "Y2-1_Top-bord": {"nano_x": None, "nano_y": 13  },
-            "Y2-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y2-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y2-1_R-bord"  : {"nano_x": 7,   "nano_y": None},
+            "Y2-1_BotL"  : {"nano_x": 1   , "nano_y": 1   },
+            "Y2-1_BotR"  : {"nano_x": 7   , "nano_y": 1   },
+            "Y2-1_TopR"  : {"nano_x": 7   , "nano_y": 13  },
+            "Y2-1_L-bord": {"nano_x": 1   , "nano_y": None},
         },
     },
     "Y2-2": {
@@ -213,14 +211,10 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240920_13w-02-ms01-young-Y2",
         "corner_annotations": {
-            "Y2-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y2-2_BotR"    : {"nano_x": 7,   "nano_y": 1   },
-            "Y2-2_TopL"    : {"nano_x": 1,    "nano_y": 14  },
-            "Y2-2_TopR"    : {"nano_x": 7,   "nano_y": 14  },
-            "Y2-2_Top-bord": {"nano_x": None, "nano_y": 14  },
-            "Y2-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y2-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y2-2_R-bord"  : {"nano_x": 7,   "nano_y": None},
+            "Y2-2_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "Y2-2_BotR": {"nano_x": 7   , "nano_y": 1   },
+            "Y2-2_TopL": {"nano_x": 1   , "nano_y": 14  },
+            "Y2-2_TopR": {"nano_x": 7   , "nano_y": 14  },
         },
     },
     "Y4-1": {
@@ -232,14 +226,10 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240916_13w-02b-ms01-young-Y4-1",
         "corner_annotations": {
-            "Y4-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y4-1_BotR"    : {"nano_x": 6,   "nano_y": 1   },
-            "Y4-1_TopL"    : {"nano_x": 1,    "nano_y": 19  },
-            "Y4-1_TopR"    : {"nano_x": 6,   "nano_y": 19  },
-            "Y4-1_Top-bord": {"nano_x": None, "nano_y": 19  },
-            "Y4-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y4-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y4-1_R-bord"  : {"nano_x": 6,   "nano_y": None},
+            "Y4-1_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "Y4-1_BotR": {"nano_x": 6   , "nano_y": 1   },
+            "Y4-1_TopL": {"nano_x": 1   , "nano_y": 19  },
+            "Y4-1_TopR": {"nano_x": 6   , "nano_y": 19  },
         },
     },
     "Y4-2": {
@@ -251,14 +241,10 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240916_13w-02c-ms01-young-Y4-2",
         "corner_annotations": {
-            "Y4-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y4-2_BotR"    : {"nano_x": 26,  "nano_y": 1   },
-            "Y4-2_TopL"    : {"nano_x": 1,    "nano_y": 17  },
-            "Y4-2_TopR"    : {"nano_x": 26,  "nano_y": 17  },
-            "Y4-2_Top-bord": {"nano_x": None, "nano_y": 17  },
-            "Y4-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y4-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y4-2_R-bord"  : {"nano_x": 26,  "nano_y": None},
+            "Y4-2_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "Y4-2_BotR": {"nano_x": 26  , "nano_y": 1   },
+            "Y4-2_TopL": {"nano_x": 1   , "nano_y": 17  },
+            "Y4-2_TopR": {"nano_x": 26  , "nano_y": 17  },
         },
     },
     "Y5-1": {
@@ -270,14 +256,11 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240917_13w-01-ms01-young-Y5",
         "corner_annotations": {
-            "Y5-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y5-1_BotR"    : {"nano_x": 10,  "nano_y": 1   },
-            "Y5-1_TopL"    : {"nano_x": 1,    "nano_y": 12  },
-            "Y5-1_TopR"    : {"nano_x": 10,  "nano_y": 12  },
-            "Y5-1_Top-bord": {"nano_x": None, "nano_y": 12  },
+            "Y5-1_BotL"    : {"nano_x": 1   , "nano_y": 1   },
+            "Y5-1_TopL"    : {"nano_x": 1   , "nano_y": 12  },
+            "Y5-1_TopR"    : {"nano_x": 10  , "nano_y": 12  },
+            "Y5-1_R-bord"  : {"nano_x": 10  , "nano_y": None},
             "Y5-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y5-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y5-1_R-bord"  : {"nano_x": 10,  "nano_y": None},
         },
     },
     "Y5-2": {
@@ -289,14 +272,11 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240917_13w-01-ms01-young-Y5",
         "corner_annotations": {
-            "Y5-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y5-2_BotR"    : {"nano_x": 23,  "nano_y": 1   },
-            "Y5-2_TopL"    : {"nano_x": 1,    "nano_y": 15  },
-            "Y5-2_TopR"    : {"nano_x": 23,  "nano_y": 15  },
-            "Y5-2_Top-bord": {"nano_x": None, "nano_y": 15  },
+            "Y5-2_BotR"    : {"nano_x": 23  , "nano_y": 1   },
+            "Y5-2_TopR"    : {"nano_x": 23  , "nano_y": 15  },
+            "Y5-2_TopL"    : {"nano_x": 1   , "nano_y": 15  },
+            "Y5-2_L-bord"  : {"nano_x": 1   , "nano_y": None},
             "Y5-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y5-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y5-2_R-bord"  : {"nano_x": 23,  "nano_y": None},
         },
     },
     "Y5-3": {
@@ -308,14 +288,10 @@ ROI_CONFIGS = {
         "age_group"  : "young",
         "source_slice": "20240917_13w-01-ms01-young-Y5",
         "corner_annotations": {
-            "Y5-3_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "Y5-3_BotR"    : {"nano_x": 23,  "nano_y": 1   },
-            "Y5-3_TopL"    : {"nano_x": 1,    "nano_y": 4   },
-            "Y5-3_TopR"    : {"nano_x": 23,  "nano_y": 4   },
+            "Y5-3_BotR"    : {"nano_x": 23  , "nano_y": 1   },
+            "Y5-3_TopR"    : {"nano_x": 23  , "nano_y": 4   },
             "Y5-3_Top-bord": {"nano_x": None, "nano_y": 4   },
             "Y5-3_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "Y5-3_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "Y5-3_R-bord"  : {"nano_x": 23,  "nano_y": None},
         },
     },
     "A1-1": {
@@ -327,14 +303,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240909_14m-02-ms02-aged-A1-1",
         "corner_annotations": {
-            "A1-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A1-1_BotR"    : {"nano_x": 10,  "nano_y": 1   },
-            "A1-1_TopL"    : {"nano_x": 1,    "nano_y": 21  },
-            "A1-1_TopR"    : {"nano_x": 10,  "nano_y": 21  },
-            "A1-1_Top-bord": {"nano_x": None, "nano_y": 21  },
-            "A1-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A1-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A1-1_R-bord"  : {"nano_x": 10,  "nano_y": None},
+            "A1-1_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "A1-1_BotR": {"nano_x": 10  , "nano_y": 1   },
+            "A1-1_TopL": {"nano_x": 1   , "nano_y": 21  },
+            "A1-1_TopR": {"nano_x": 10  , "nano_y": 21  },
         },
     },
     "A1-2": {
@@ -346,14 +318,11 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240909_14m-02c-ms02-aged-A1-2",
         "corner_annotations": {
-            "A1-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A1-2_BotR"    : {"nano_x": 8,   "nano_y": 1   },
-            "A1-2_TopL"    : {"nano_x": 1,    "nano_y": 21  },
-            "A1-2_TopR"    : {"nano_x": 8,   "nano_y": 21  },
+            "A1-2_BotL"    : {"nano_x": 1   , "nano_y": 1   },
+            "A1-2_BotR"    : {"nano_x": 8   , "nano_y": 1   },
+            "A1-2_TopL"    : {"nano_x": 1   , "nano_y": 21  },
             "A1-2_Top-bord": {"nano_x": None, "nano_y": 21  },
-            "A1-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A1-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A1-2_R-bord"  : {"nano_x": 8,   "nano_y": None},
+            "A1-2_R-bord"  : {"nano_x": 8   , "nano_y": None},
         },
     },
     "A2-1": {
@@ -365,14 +334,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240909_14m-01-ms01-aged-A2-1",
         "corner_annotations": {
-            "A2-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A2-1_BotR"    : {"nano_x": 4,   "nano_y": 1   },
-            "A2-1_TopL"    : {"nano_x": 1,    "nano_y": 17  },
-            "A2-1_TopR"    : {"nano_x": 4,   "nano_y": 17  },
-            "A2-1_Top-bord": {"nano_x": None, "nano_y": 17  },
-            "A2-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A2-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A2-1_R-bord"  : {"nano_x": 4,   "nano_y": None},
+            "A2-1_BotL"  : {"nano_x": 1   , "nano_y": 1   },
+            "A2-1_BotR"  : {"nano_x": 4   , "nano_y": 1   },
+            "A2-1_L-bord": {"nano_x": 1   , "nano_y": None},
+            "A2-1_R-bord": {"nano_x": 4   , "nano_y": None},
         },
     },
     "A2-3": {
@@ -384,14 +349,9 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240909_14m-01-ms01-aged-A2-1",
         "corner_annotations": {
-            "A2-3_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A2-3_BotR"    : {"nano_x": 4,   "nano_y": 1   },
-            "A2-3_TopL"    : {"nano_x": 1,    "nano_y": 14  },
-            "A2-3_TopR"    : {"nano_x": 4,   "nano_y": 14  },
-            "A2-3_Top-bord": {"nano_x": None, "nano_y": 14  },
+            "A2-3_BotL"    : {"nano_x": 1   , "nano_y": 1   },
+            "A2-3_L-bord"  : {"nano_x": 1   , "nano_y": None},
             "A2-3_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A2-3_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A2-3_R-bord"  : {"nano_x": 4,   "nano_y": None},
         },
     },
     "A2-2": {
@@ -403,14 +363,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240909_14m-01b-ms01-aged-A2-2",
         "corner_annotations": {
-            "A2-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A2-2_BotR"    : {"nano_x": 10,  "nano_y": 1   },
-            "A2-2_TopL"    : {"nano_x": 1,    "nano_y": 20  },
-            "A2-2_TopR"    : {"nano_x": 10,  "nano_y": 20  },
-            "A2-2_Top-bord": {"nano_x": None, "nano_y": 20  },
-            "A2-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A2-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A2-2_R-bord"  : {"nano_x": 10,  "nano_y": None},
+            "A2-2_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "A2-2_BotR": {"nano_x": 10  , "nano_y": 1   },
+            "A2-2_TopL": {"nano_x": 1   , "nano_y": 20  },
+            "A2-2_TopR": {"nano_x": 10  , "nano_y": 20  },
         },
     },
     "A3-1": {
@@ -422,14 +378,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240906_14m-01b-ms01-aged-A3",
         "corner_annotations": {
-            "A3-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A3-1_BotR"    : {"nano_x": 11,  "nano_y": 1   },
-            "A3-1_TopL"    : {"nano_x": 1,    "nano_y": 8   },
-            "A3-1_TopR"    : {"nano_x": 11,  "nano_y": 8   },
-            "A3-1_Top-bord": {"nano_x": None, "nano_y": 8   },
-            "A3-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A3-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A3-1_R-bord"  : {"nano_x": 11,  "nano_y": None},
+            "A3-1_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "A3-1_BotR": {"nano_x": 11  , "nano_y": 1   },
+            "A3-1_TopL": {"nano_x": 1   , "nano_y": 8   },
+            "A3-1_TopR": {"nano_x": 11  , "nano_y": 8   },
         },
     },
     "A3-2": {
@@ -441,14 +393,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240906_14m-01b-ms01-aged-A3",
         "corner_annotations": {
-            "A3-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A3-2_BotR"    : {"nano_x": 29,  "nano_y": 1   },
-            "A3-2_TopL"    : {"nano_x": 1,    "nano_y": 4   },
-            "A3-2_TopR"    : {"nano_x": 29,  "nano_y": 4   },
+            "A3-2_BotL"    : {"nano_x": 1   , "nano_y": 1   },
+            "A3-2_TopL"    : {"nano_x": 1   , "nano_y": 4   },
             "A3-2_Top-bord": {"nano_x": None, "nano_y": 4   },
             "A3-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A3-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A3-2_R-bord"  : {"nano_x": 29,  "nano_y": None},
         },
     },
     "A3-3": {
@@ -460,14 +408,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240906_14m-01b-ms01-aged-A3",
         "corner_annotations": {
-            "A3-3_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A3-3_BotR"    : {"nano_x": 15,  "nano_y": 1   },
-            "A3-3_TopL"    : {"nano_x": 1,    "nano_y": 7   },
-            "A3-3_TopR"    : {"nano_x": 15,  "nano_y": 7   },
+            "A3-3_BotL"    : {"nano_x": 1   , "nano_y": 1   },
+            "A3-3_TopL"    : {"nano_x": 1   , "nano_y": 7   },
             "A3-3_Top-bord": {"nano_x": None, "nano_y": 7   },
             "A3-3_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A3-3_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A3-3_R-bord"  : {"nano_x": 15,  "nano_y": None},
         },
     },
     "A6-1": {
@@ -479,14 +423,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240903_14m-02-ms02-aged-A6",
         "corner_annotations": {
-            "A6-1_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A6-1_BotR"    : {"nano_x": 5,   "nano_y": 1   },
-            "A6-1_TopL"    : {"nano_x": 1,    "nano_y": 13  },
-            "A6-1_TopR"    : {"nano_x": 5,   "nano_y": 13  },
-            "A6-1_Top-bord": {"nano_x": None, "nano_y": 13  },
-            "A6-1_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A6-1_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A6-1_R-bord"  : {"nano_x": 5,   "nano_y": None},
+            "A6-1_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "A6-1_BotR": {"nano_x": 5   , "nano_y": 1   },
+            "A6-1_TopL": {"nano_x": 1   , "nano_y": 13  },
+            "A6-1_TopR": {"nano_x": 5   , "nano_y": 13  },
         },
     },
     "A6-2": {
@@ -498,14 +438,10 @@ ROI_CONFIGS = {
         "age_group"  : "aged",
         "source_slice": "20240903_14m-02-ms02-aged-A6",
         "corner_annotations": {
-            "A6-2_BotL"    : {"nano_x": 1,    "nano_y": 1   },
-            "A6-2_BotR"    : {"nano_x": 10,  "nano_y": 1   },
-            "A6-2_TopL"    : {"nano_x": 1,    "nano_y": 22  },
-            "A6-2_TopR"    : {"nano_x": 10,  "nano_y": 22  },
-            "A6-2_Top-bord": {"nano_x": None, "nano_y": 22  },
-            "A6-2_Bot-bord": {"nano_x": None, "nano_y": 1   },
-            "A6-2_L-bord"  : {"nano_x": 1,    "nano_y": None},
-            "A6-2_R-bord"  : {"nano_x": 10,  "nano_y": None},
+            "A6-2_BotL": {"nano_x": 1   , "nano_y": 1   },
+            "A6-2_BotR": {"nano_x": 10  , "nano_y": 1   },
+            "A6-2_TopL": {"nano_x": 1   , "nano_y": 22  },
+            "A6-2_TopR": {"nano_x": 10  , "nano_y": 22  },
         },
     },
 }
@@ -857,7 +793,30 @@ def recover_axes_from_corners(meta, corner_annotations, roi_bins_xy, n_x, n_y):
     origin = np.mean(origins, axis=0)
     print(f"    X0Y0 origin (reference only): ({origin[0]:.1f}, {origin[1]:.1f})")
  
-    return x_unit, y_unit, origin, {lbl: tuple(p) for lbl, p in corner_pos.items()}
+    def _rect(idx, n):
+        if idx == 0:
+            return 0.0
+        if idx == n - 1:
+            return float(n)
+        return float(idx) + 0.5
+
+    corner_pts = []
+    border_pts = []
+    for lbl, pos in corner_pos.items():
+        xi_n = corner_annotations[lbl]['nano_x']
+        yi_n = corner_annotations[lbl]['nano_y']
+        if xi_n is not None and yi_n is not None:
+            corner_pts.append((float(pos[0]), float(pos[1]),
+                               _rect(int(xi_n), n_x), _rect(int(yi_n), n_y)))
+        elif xi_n is not None or yi_n is not None:
+            border_pts.append((
+                float(pos[0]), float(pos[1]),
+                None if xi_n is None else _rect(int(xi_n), n_x),
+                None if yi_n is None else _rect(int(yi_n), n_y)))
+
+    return (x_unit, y_unit, origin,
+            {lbl: tuple(p) for lbl, p in corner_pos.items()},
+            corner_pts, border_pts)
  
  
 def _border_sign(i_coord, j_coord, n_max):
@@ -928,90 +887,329 @@ def _enforce_perpendicular(x_unit, y_unit):
     return x_norm, y_norm
  
  
-def assign_bins_to_grid_cells(bins_df, x_unit, y_unit, n_x, n_y):
-    """
-    Assign every ROI bin to a grid cell using coordinate projection,
-    stretching the grid to fit the exact bin cloud extent.
- 
-    Steps:
-      1. Project all bins onto x_unit and y_unit axes
-      2. Use the min/max of the projection as the grid boundaries
-         (this makes the grid fit the ROI exactly, regardless of scale)
-      3. Divide both ranges equally into n_x and n_y cells
-      4. For each cell: compute centroid of ALL bins in the cell,
-         then select the nearest N_BINS_PER_BOX as within_footprint=True
-      5. Remaining bins in the cell have within_footprint=False but
-         keep their cell assignment for traceability
- 
-    Since x_unit and y_unit form an orthonormal basis in 2D, the
-    projection is lossless and every bin is assigned to exactly one cell.
- 
-    Returns
-    -------
-    result          : bins_df with assignment columns added
-    grid_extent     : (x_min, x_max, y_min, y_max) in projection space
-                      (used by the plotting function to draw cell outlines)
-    """
-    bin_xy = bins_df[['x', 'y']].values
- 
-    # Project onto rotation axes
-    proj_x = bin_xy @ x_unit
-    proj_y = bin_xy @ y_unit
- 
-    # Grid extent = actual bin cloud extent
-    x_min, x_max = proj_x.min(), proj_x.max()
-    y_min, y_max = proj_y.min(), proj_y.max()
-    x_range = x_max - x_min
-    y_range = y_max - y_min
- 
-    cell_w = x_range / n_x   # cell width along x_unit (um)
-    cell_h = y_range / n_y   # cell height along y_unit (um)
-    print(f"  Grid fitted to bin extent: "
-          f"{x_range:.1f} um x {y_range:.1f} um")
-    print(f"  Cell size: {cell_w:.1f} um x {cell_h:.1f} um")
- 
-    # Cell index for each bin (clip handles floating-point boundary bins)
-    xi_fl = np.floor((proj_x - x_min) / x_range * n_x).astype(int).clip(0, n_x-1)
-    yi_fl = np.floor((proj_y - y_min) / y_range * n_y).astype(int).clip(0, n_y-1)
- 
-    result = bins_df.copy()
-    result['assigned_x_idx']        = xi_fl
-    result['assigned_y_idx']        = yi_fl
-    result['dist_from_centroid_um'] = np.nan
-    result['within_footprint']      = False
-    result['low_confidence']        = False
- 
-    low_conf = 0
-    for xi in range(n_x):
-        for yi in range(n_y):
-            mask    = (result['assigned_x_idx'] == xi) & \
-                      (result['assigned_y_idx'] == yi)
-            box_idx = result.index[mask]
-            n_box   = len(box_idx)
-            if n_box == 0:
+def tissue_of(roi_key):
+    return _re.sub(r"-\d+$", "", str(roi_key).strip())
+
+
+def _pack(ax, ay, origin, corner_pts, source, mode):
+    ax = np.asarray(ax, float); ay = np.asarray(ay, float)
+    origin = np.asarray(origin, float)
+    resid = 0.0
+    if corner_pts:
+        P = np.array([[c[0], c[1]] for c in corner_pts], float)
+        UV = np.array([[c[2], c[3]] for c in corner_pts], float)
+        pred = origin + UV[:, [0]] * ax + UV[:, [1]] * ay
+        resid = float(np.linalg.norm(P - pred, axis=1).mean())
+    sx, sy = float(np.linalg.norm(ax)), float(np.linalg.norm(ay))
+    cosang = float(np.dot(ax, ay) / max(sx * sy, 1e-12))
+    return dict(ax=ax, ay=ay, origin=origin,
+                spacing_x=sx, spacing_y=sy,
+                spacing=float((sx + sy) / 2.0),
+                angle=float(np.degrees(np.arctan2(ax[1], ax[0]))),
+                shear=float(90.0 - np.degrees(np.arccos(np.clip(cosang, -1, 1)))),
+                reflected=bool(ax[0] * ay[1] - ax[1] * ay[0] < 0),
+                resid=resid, n=len(corner_pts), source=source, mode=mode)
+
+
+def fit_affine(corner_pts):
+    if len(corner_pts) < 3:
+        return None
+    UV = np.array([[c[2], c[3], 1.0] for c in corner_pts], float)
+    P = np.array([[c[0], c[1]] for c in corner_pts], float)
+    if np.linalg.matrix_rank(UV) < 3:
+        return None
+    M, *_ = np.linalg.lstsq(UV, P, rcond=None)
+    return _pack(M[0], M[1], M[2], corner_pts, 'own corners', 'affine')
+
+
+def border_score(fit, border_pts, n_x, n_y):
+    if fit is None or not border_pts:
+        return 0.0
+    A = np.column_stack([fit['ax'], fit['ay']])
+    if abs(np.linalg.det(A)) < 1e-9:
+        return -1e9
+    score = 0.0
+    for x, y, u, v in border_pts:
+        uv = np.linalg.solve(A, np.array([x, y], float) - fit['origin'])
+        if u is not None:
+            score += 1.0 if abs(uv[0] - u) <= 1.0 else -1.0
+            score += 1.0 if -1.0 <= uv[1] <= n_y + 1.0 else -1.0
+        else:
+            score += 1.0 if abs(uv[1] - v) <= 1.0 else -1.0
+            score += 1.0 if -1.0 <= uv[0] <= n_x + 1.0 else -1.0
+    return score
+
+
+def fit_similarity(corner_pts, border_pts=None, n_x=None, n_y=None):
+    if len(corner_pts) < 2:
+        return None
+    g = np.array([c[2] + 1j * c[3] for c in corner_pts], dtype=complex)
+    p = np.array([c[0] + 1j * c[1] for c in corner_pts], dtype=complex)
+    cands = []
+    for reflected in (False, True):
+        gg = np.conj(g) if reflected else g
+        gm, pm = gg.mean(), p.mean()
+        denom = float((np.abs(gg - gm) ** 2).sum())
+        if denom < 1e-12:
+            continue
+        a = ((p - pm) * np.conj(gg - gm)).sum() / denom
+        b = pm - a * gm
+        ax = np.array([a.real, a.imag])
+        ay = np.array([-a.imag, a.real])
+        if reflected:
+            ay = -ay
+        cands.append(_pack(ax, ay, [b.real, b.imag], corner_pts,
+                           'own corners', 'similarity'))
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    tol = 0.25 * max(c['spacing'] for c in cands)
+    if abs(cands[0]['resid'] - cands[1]['resid']) < tol and border_pts:
+        sc = [border_score(c, border_pts, n_x, n_y) for c in cands]
+        if sc[0] != sc[1]:
+            pick = cands[int(np.argmax(sc))]
+            print(f"           reflection resolved by border annotations "
+                  f"(scores {sc[0]:.0f} vs {sc[1]:.0f})")
+            return pick
+    return min(cands, key=lambda c: c['resid'])
+
+
+def fit_with_spacing(corner_pts, x_unit, y_unit, spacing,
+                     border_pts=None, n_x=None, n_y=None):
+    if not corner_pts or spacing is None:
+        return None
+    P = np.array([[c[0], c[1]] for c in corner_pts], float)
+    UV = np.array([[c[2], c[3]] for c in corner_pts], float)
+    f = fit_from_annotations(corner_pts, border_pts, n_x, n_y,
+                             fallback=spacing)
+    if f is not None:
+        f['source'] = 'corners + borders'
+        return f
+    cands = []
+    for sgn in (1.0, -1.0):
+        ax = spacing * np.asarray(x_unit, float)
+        ay = sgn * spacing * np.asarray(y_unit, float)
+        origin = (P - UV[:, [0]] * ax - UV[:, [1]] * ay).mean(axis=0)
+        cands.append(_pack(ax, ay, origin, corner_pts, 'tissue spacing',
+                           'fixed scale'))
+    if border_pts:
+        sc = [border_score(c, border_pts, n_x, n_y) for c in cands]
+        if sc[0] != sc[1]:
+            return cands[int(np.argmax(sc))]
+    return cands[0]
+
+
+def _unit(v):
+    n = float(np.linalg.norm(v))
+    return None if n < 1e-9 else np.asarray(v, float) / n
+
+
+def _axis_from_annotations(corner_pts, border_pts, n_x, n_y, axis):
+    ki, oi = (2, 3) if axis == 'x' else (3, 2)
+    n_along = n_x if axis == 'x' else n_y
+    vecs, dirs = [], []
+
+    full = [c for c in corner_pts]
+    for i in range(len(full)):
+        for j in range(i + 1, len(full)):
+            a, b = full[i], full[j]
+            if abs(a[oi] - b[oi]) > 1e-9:
                 continue
- 
-            # Centroid = mean position of all bins in this cell
-            box_xy   = result.loc[box_idx, ['x', 'y']].values
-            centroid = box_xy.mean(axis=0)
-            dists    = np.sqrt(((box_xy - centroid) ** 2).sum(axis=1))
-            result.loc[box_idx, 'dist_from_centroid_um'] = dists
- 
-            # Select nearest N_BINS_PER_BOX
-            n_sel   = min(N_BINS_PER_BOX, n_box)
-            sel_idx = box_idx[np.argsort(dists)[:n_sel]]
-            result.loc[sel_idx, 'within_footprint'] = True
- 
-            if n_box < MIN_BINS_PER_BOX:
-                result.loc[sel_idx, 'low_confidence'] = True
+            d = b[ki] - a[ki]
+            if abs(d) < 1e-9:
+                continue
+            vecs.append((np.array([b[0], b[1]]) - np.array([a[0], a[1]])) / d)
+
+    for bp in (border_pts or []):
+        if bp[ki] is not None or bp[oi] is None:
+            continue
+        for c in full:
+            if abs(c[oi] - bp[oi]) > 1e-9:
+                continue
+            sgn = 1.0 if c[ki] <= 1e-9 else (-1.0 if c[ki] >= n_along - 1e-9
+                                             else 0.0)
+            if sgn == 0.0:
+                continue
+            u = _unit(np.array([bp[0], bp[1]]) - np.array([c[0], c[1]]))
+            if u is not None:
+                dirs.append(sgn * u)
+
+    return (np.mean(vecs, axis=0) if vecs else None,
+            _unit(np.mean(dirs, axis=0)) if dirs else None)
+
+
+def fit_from_annotations(corner_pts, border_pts, n_x, n_y, fallback=None):
+    if not corner_pts:
+        return None
+    ax_v, ax_d = _axis_from_annotations(corner_pts, border_pts, n_x, n_y, 'x')
+    ay_v, ay_d = _axis_from_annotations(corner_pts, border_pts, n_x, n_y, 'y')
+    if ax_v is None and ay_v is None and ax_d is None and ay_d is None:
+        return None
+
+    mag = None
+    if ax_v is not None:
+        mag = float(np.linalg.norm(ax_v))
+    if ay_v is not None:
+        mag = float(np.linalg.norm(ay_v)) if mag is None else mag
+    if mag is None:
+        mag = fallback
+    if mag is None:
+        return None
+
+    if ax_v is not None:
+        ax = ax_v
+    elif ax_d is not None:
+        ax = ax_d * (float(np.linalg.norm(ay_v)) if ay_v is not None else mag)
+    else:
+        u = _unit(ay_v if ay_v is not None else np.array([1.0, 0.0]))
+        ax = np.array([u[1], -u[0]]) * mag
+
+    if ay_v is not None:
+        ay = ay_v
+    elif ay_d is not None:
+        ay = ay_d * float(np.linalg.norm(ax))
+    else:
+        u = _unit(ax)
+        ay = np.array([-u[1], u[0]]) * float(np.linalg.norm(ax))
+
+    P = np.array([[c[0], c[1]] for c in corner_pts], float)
+    UV = np.array([[c[2], c[3]] for c in corner_pts], float)
+    origin = (P - UV[:, [0]] * ax - UV[:, [1]] * ay).mean(axis=0)
+    src = 'own corners' if (ax_v is not None and ay_v is not None) \
+        else 'corners + borders'
+    return _pack(ax, ay, origin, corner_pts, src, 'annotation')
+
+
+def solve_roi(corner_pts, border_pts=None, n_x=None, n_y=None):
+    if len(corner_pts) >= 3:
+        f = fit_affine(corner_pts)
+        if f is not None:
+            return f
+    f = fit_from_annotations(corner_pts, border_pts, n_x, n_y)
+    if f is not None:
+        return f
+    return fit_similarity(corner_pts, border_pts, n_x, n_y)
+
+
+def resolve_tissue_spacings(fits):
+    by_tissue = {}
+    for roi, f in fits.items():
+        if f is not None:
+            by_tissue.setdefault(tissue_of(roi), []).append(f['spacing'])
+    out = {}
+    for t, vals in sorted(by_tissue.items()):
+        out[t] = float(np.median(vals))
+        if len(vals) > 1:
+            spread = max(vals) - min(vals)
+            flag = '   <- CHECK, ROIs disagree' if spread > 2.0 else ''
+            print(f"    {t}: spacing {out[t]:.2f} um from {len(vals)} ROI(s), "
+                  f"range {min(vals):.2f} to {max(vals):.2f}{flag}")
+        else:
+            print(f"    {t}: spacing {out[t]:.2f} um from 1 ROI "
+                  f"(no cross-check available)")
+    return out
+
+
+def report_fit(roi, fit):
+    if fit is None:
+        print(f"  {roi:<8s} NO FIT: too few full corners")
+        return
+    print(f"  {roi:<8s} cell {fit['spacing_x']:6.2f} x {fit['spacing_y']:6.2f} um"
+          f"   angle {fit['angle']:7.1f} deg   shear {fit['shear']:+5.1f} deg"
+          f"   resid {fit['resid']:5.1f} um "
+          f"({fit['resid']/max(fit['spacing'],1e-9):.2f} cell)"
+          f"   {fit['n']} corner(s), {fit['mode']}, {fit['source']}"
+          f"{'   REFLECTED' if fit['reflected'] else ''}")
+    if fit['resid'] > 0.5 * fit['spacing']:
+        print("           [WARNING] corners do not lie on one grid. Check the "
+              "annotated bins and their indices.")
+    if abs(fit['shear']) > 8.0:
+        print("           [WARNING] grid is strongly sheared. Corners are "
+              "probably mislabelled or misplaced.")
+    if fit['spacing_x'] > 0 and fit['spacing_y'] > 0:
+        ratio = max(fit['spacing_x'], fit['spacing_y']) / \
+                min(fit['spacing_x'], fit['spacing_y'])
+        if ratio > 1.25:
+            print("           [WARNING] x and y cell sizes differ by more "
+                  f"than 25% ({ratio:.2f}x).")
+
+
+
+def assign_bins_to_grid_cells(bins_df, fit, n_x, n_y):
+    ax, ay, origin = fit['ax'], fit['ay'], fit['origin']
+    sx, sy = fit['spacing_x'], fit['spacing_y']
+
+    x_unit = ax / max(np.linalg.norm(ax), 1e-12)
+    y_unit = ay / max(np.linalg.norm(ay), 1e-12)
+
+    ii, jj = np.meshgrid(np.arange(n_x), np.arange(n_y), indexing='ij')
+    uu = ii.ravel() + 0.5
+    vv = jj.ravel() + 0.5
+    cen_xy = origin + uu[:, None] * ax + vv[:, None] * ay
+
+    bin_xy = bins_df[['x', 'y']].values
+    A = np.column_stack([ax, ay])
+    if abs(np.linalg.det(A)) < 1e-9:
+        print("  [ERROR] degenerate grid axes; skipping ROI.")
+        empty = bins_df.copy()
+        empty['assigned_x_idx'] = -1
+        empty['assigned_y_idx'] = -1
+        empty['dist_from_centroid_um'] = np.nan
+        empty['within_footprint'] = False
+        empty['low_confidence'] = False
+        return empty, (ax, ay, origin), x_unit, y_unit
+
+    uvb = np.linalg.solve(A, (bin_xy - origin).T).T
+    xi = np.floor(uvb[:, 0]).astype(int)
+    yi = np.floor(uvb[:, 1]).astype(int)
+
+    inside = (xi >= 0) & (xi < n_x) & (yi >= 0) & (yi < n_y)
+    xi_c, yi_c = xi.clip(0, n_x - 1), yi.clip(0, n_y - 1)
+    dist = np.linalg.norm(bin_xy - cen_xy[xi_c * n_y + yi_c], axis=1)
+    keep = inside & (dist <= MAX_CENTROID_DIST_FRAC * max(sx, sy))
+
+    n_out = int((~keep).sum())
+    if n_out:
+        pct = 100.0 * n_out / len(bins_df)
+        print(f"  Bins outside the fitted grid: {n_out:,} of "
+              f"{len(bins_df):,} ({pct:.0f}%)")
+        if pct > 50:
+            print("    [WARNING] over half the ROI bins fall outside the grid. "
+                  "The polygon is much larger than the indentation footprint, "
+                  "or the corner annotations are wrong.")
+
+    result = bins_df.copy()
+    result['assigned_x_idx'] = np.where(keep, xi_c, -1)
+    result['assigned_y_idx'] = np.where(keep, yi_c, -1)
+    result['dist_from_centroid_um'] = np.where(keep, dist, np.nan)
+    result['within_footprint'] = False
+    result['low_confidence'] = False
+
+    low_conf = empty = 0
+    for cx in range(n_x):
+        for cy in range(n_y):
+            mask = keep & (xi_c == cx) & (yi_c == cy)
+            idx = result.index[mask]
+            if len(idx) == 0:
+                empty += 1
+                continue
+            d = dist[mask]
+            sel = idx[np.argsort(d)[:min(N_BINS_PER_BOX, len(idx))]]
+            result.loc[sel, 'within_footprint'] = True
+            if len(idx) < MIN_BINS_PER_BOX:
+                result.loc[sel, 'low_confidence'] = True
                 low_conf += 1
- 
+
+    if empty:
+        print(f"  Cells with no bins: {empty} of {n_x * n_y}")
     if low_conf:
         print(f"  Low-confidence cells (< {MIN_BINS_PER_BOX} bins): {low_conf}")
- 
-    return result, (x_min, x_max, y_min, y_max)
- 
- 
+
+    return result, (ax, ay, origin), x_unit, y_unit
+
+
+
 def attach_mechanical_values(bins_assigned, nano_df):
     """
     Attach mechanical property values to each selected bin via
@@ -1071,15 +1269,16 @@ def plot_verification(roi_bins, assigned_bins, x_unit, y_unit,
       Gold star    = extrapolated X0Y0 (reference only)
       Magenta dot  = annotated corner bins
     """
-    x_min, x_max, y_min, y_max = grid_extent
-    x_range = x_max - x_min
-    y_range = y_max - y_min
-    cell_w  = x_range / n_x
-    cell_h  = y_range / n_y
+    ax_v, ay_v, org_v = grid_extent
+    ax_v = np.asarray(ax_v, float)
+    ay_v = np.asarray(ay_v, float)
+    org_v = np.asarray(org_v, float)
+    x_min = y_min = 0.0
+    cell_w = cell_h = 1.0
  
     def proj_to_visium(px, py):
         """Convert projection-space coords back to VisiumHD space."""
-        return px * x_unit + py * y_unit
+        return org_v + px * ax_v + py * ay_v
  
     fig, ax = plt.subplots(figsize=(14, 8))
  
@@ -1248,6 +1447,47 @@ def main():
             meta['valid_measurement'] = 'False'
             meta['low_confidence'] = 'False'
 
+            print("\n[1/3] Fitting grid geometry from corner annotations")
+            GEOM = {}
+            for _rk, _cfg in ROI_CONFIGS.items():
+                _m = meta[COL_ROI] == _cfg['roi_label']
+                if _m.sum() == 0:
+                    GEOM[_rk] = dict(fit=None)
+                    print(f"  {_rk:<8s} NO BINS for {COL_ROI} == "
+                          f"'{_cfg['roi_label']}'")
+                    continue
+                _xy = meta.loc[_m, [COL_X, COL_Y]].values
+                try:
+                    _xu, _yu, _or, _cp, _pts, _bpts = recover_axes_from_corners(
+                        meta,
+                        to_internal_corners(_cfg['corner_annotations']),
+                        _xy, _cfg['n_x'], _cfg['n_y'])
+                except ValueError as _e:
+                    print(f"  {_rk:<8s} ERROR: {_e}")
+                    GEOM[_rk] = dict(fit=None)
+                    continue
+                GEOM[_rk] = dict(x_unit=_xu, y_unit=_yu, origin=_or,
+                                 corner_positions=_cp, corner_pts=_pts,
+                                 border_pts=_bpts,
+                                 fit=solve_roi(_pts, _bpts,
+                                               _cfg['n_x'], _cfg['n_y']))
+                report_fit(_rk, GEOM[_rk]['fit'])
+
+            print("\n[2/3] Resolving spacing per tissue")
+            _sp = resolve_tissue_spacings(
+                {k: v.get('fit') for k, v in GEOM.items()})
+            for _rk, _g in GEOM.items():
+                if _g.get('fit') is None and 'corner_pts' in _g:
+                    _g['fit'] = fit_with_spacing(
+                        _g['corner_pts'], _g['x_unit'], _g['y_unit'],
+                        _sp.get(tissue_of(_rk)), _g.get('border_pts'),
+                        ROI_CONFIGS[_rk]['n_x'], ROI_CONFIGS[_rk]['n_y'])
+                    report_fit(_rk, _g['fit'])
+                    if _g['fit'] is None:
+                        print(f"  {_rk:<8s} [FATAL] no full corner and no "
+                              f"tissue spacing available")
+
+            print("\n[3/3] Assigning bins")
             for roi_key, cfg in ROI_CONFIGS.items():
                 print(f"\n{'=' * 60}")
                 print(f"ROI: {roi_key}")
@@ -1265,32 +1505,21 @@ def main():
                 roi_bins.index = meta.index[roi_mask]
                 roi_bins_xy = roi_bins[['x', 'y']].values
 
-                print(
-                    f" Recovering rotation axes from "
-                    f"{len(cfg['corner_annotations'])} corner annotations..."
-                )
-
-                try:
-                    x_unit, y_unit, origin, corner_positions = recover_axes_from_corners(
-                        meta,
-                        to_internal_corners(cfg['corner_annotations']),
-                        roi_bins_xy,
-                        cfg['n_x'],
-                        cfg['n_y'],
-                    )
-                except ValueError as e:
-                    print(f" ERROR: {e}")
+                g = GEOM.get(roi_key)
+                if g is None or g['fit'] is None:
+                    print(f" ERROR: no grid solution for {roi_key}.")
                     continue
+                x_unit, y_unit = g['x_unit'], g['y_unit']
+                origin, corner_positions = g['origin'], g['corner_positions']
 
                 print(
                     f" Assigning {n_roi:,} bins to "
                     f"{cfg['n_x']} x {cfg['n_y']} grid cells..."
                 )
 
-                assigned, grid_extent = assign_bins_to_grid_cells(
+                assigned, grid_extent, x_unit, y_unit = assign_bins_to_grid_cells(
                     roi_bins,
-                    x_unit,
-                    y_unit,
+                    g['fit'],
                     cfg['n_x'],
                     cfg['n_y'],
                 )
@@ -1470,4 +1699,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 

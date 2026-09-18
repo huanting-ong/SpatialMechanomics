@@ -1,0 +1,3399 @@
+---
+title: "Export expression data for stiffness-transcriptome regression; DEG & GSEA comparisons for Young and Aged"
+author: "Huan Ting Ong"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    keep_md: true
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width = 6,
+                      fig.height = 5,
+                      echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+<!--
+READING ORDER
+
+This file is ordered as the analysis runs, top to bottom. Run the chunks in
+order once and every figure and table in the manuscript is produced; nothing
+below needs a second pass over anything above it.
+
+  1  Export expression        writes the .mtx for the stiffness analysis
+  2  Configuration            constants, helpers, plotting functions. No data,
+                              no computation. Cheap; re-run whenever the code
+                              changes.
+  3  Data                     metadata merge, MSigDB gene sets, matrisome list
+  4  Compartment + cluster tests
+  5  Global pooled test
+  6  Leading-edge redundancy
+  7  Meta-modules across tests
+  8  Over-representation analysis (optional; threshold-respecting)
+  9  Curation step 1          writes the *_toplot.csv QC templates
+ 10  Curation step 2          MANUAL EDIT, then the curated dot plots
+ 11  Matrisome by category, and the ligand-receptor scatter
+ 12  Supplementary tables
+  A  Appendix: replot from saved CSVs (only needed if a threshold changes)
+
+  4 and 5 need 2 and 3. 5 does not need 4. 9 needs the CSVs from 4/5 (and 8 if
+  ORA templates are wanted). 10 needs YOUR edits to the files 9 wrote.
+
+  Objects defined in 2 live in the global environment for the whole session, so
+  a session holding definitions from an older version of this file would
+  silently use the OLD ones. Chunk 2 carries CONFIG_VERSION and every consuming
+  chunk calls assert_config_current(), which stops on a mismatch.
+
+WHAT CHANGED WHEN THIS FILE WAS TIDIED FOR SUBMISSION
+  Three things were folded into the main run so that the manuscript figures
+  come out of a single pass. The numbers are unchanged; only the order and the
+  point at which figures are drawn moved.
+
+  - The matrisome volcano was a separate replot chunk. plot_volcano now takes
+    matri_tbl and run_deg_gsea passes it, so both the plain and the
+    matrisome-outlined figure are written on the first run, under the same
+    filenames as before (Volcano_*, Volcano-matrisome_*). Same colouring rule,
+    same top-10-per-direction labelling, same 3.5 x 4.0 in geometry.
+
+  - GO:CC and GO:MF were added by a second GSEA chunk that re-ran fgsea and
+    overwrote the result CSVs. All five collections are now loaded in chunk 3
+    and tested in one pass. This is not cosmetic: BH correction runs across the
+    whole tested family, so a Hallmark set's padj depends on how many GO sets
+    were tested with it. Testing all five at once is what makes the padj in the
+    figures and the padj in the curated tables the same number. The old
+    two-pass route left the automatic dot plots drawn from a three-collection
+    run while the CSVs held five.
+
+  - plot_gsea_dot called scale_colour_viridis_c while the mapped aesthetic was
+    fill (shape 21). A colour scale applies to nothing there, so ggplot fell
+    back to its default blue fill gradient and the legend carried the raw
+    column name. It is now scale_fill_viridis_c with the same settings as the
+    curated manuscript dot plot, so the automatic and curated figures match.
+
+  The curation chunks (9 and 10) are unchanged and remain a manual step.
+  Existing *_toplot.csv files are never overwritten unless CURATE_OVERWRITE is
+  TRUE, so the curated pathway selections behind the manuscript figures are not
+  affected by re-running anything here.
+
+STATISTICS, in one paragraph
+  DESeq2 is run with the ordinary Wald test, H0: log2FoldChange = 0. That is
+  the two-sided default and it returns both directions: negative LFC = higher
+  in Young, positive LFC = higher in Aged. LFC_THRESHOLD and PADJ_CUTOFF are
+  applied AFTER the test, purely to draw the lines on the volcano, colour the
+  points, count DEGs and choose labels. They are not part of the null. Change
+  them and re-run only the appendix chunk; the DESeq2 fit does not change.
+
+  GSEA does not use the threshold at all. It ranks EVERY tested gene by the
+  signed Wald statistic and looks for coordinated shifts, which is why a gene
+  set can be significant with no single member passing |LFC| > 1. Changing the
+  threshold therefore leaves every NES and every GSEA padj unchanged. The
+  optional ORA chunk is the analysis that does respect the threshold.
+-->
+
+
+# 1. Export log-norm expression
+
+Exports only bins with a valid nanoindentation so the matrix stays small.
+```{r export-expression}
+library(Seurat)
+library(Matrix)
+library(DESeq2)
+library(fgsea)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(grid)
+
+## Load last RDS using detected path
+merge.full <- readRDS(
+  "Z:/Visium_Data/01_Multi-sample-integration/merge_full_HarmonyBANKSY_SeuratClusters_annotated.rds")
+
+# Load the SpatialX metadata TSV (output of map_centroids_to_bins.py)
+metadata_tsv_path <- "Z:/Visium_Data/001_SpatialX/20260803_FinalAnnotatedMetadata/metadata_with_nano.tsv"
+
+meta_tsv <- read.delim(metadata_tsv_path, sep = "\t", stringsAsFactors = FALSE)
+
+# Keep only bins with a valid nanoindentation measurement
+meta_valid <- meta_tsv[meta_tsv$valid_measurement == "True", ]
+cat("Bins with valid mechanical measurements:", nrow(meta_valid), "\n")
+
+# Reconstruct the barcode_full identifier used as colnames(merge.full):
+#   barcode_full = "{Barcodes}.{sample_name}"   e.g. "s_004um_00000_00796-1.CA_01"
+meta_valid$barcode_full <- paste0(meta_valid$Barcodes, ".", meta_valid$CaptureArea)
+
+# Ensure RNA assay is joined and is the default
+DefaultAssay(merge.full) <- "RNA"
+merge.full[["RNA"]] <- JoinLayers(merge.full[["RNA"]])
+
+# Subset to only the barcodes present in BOTH the metadata and the Seurat object
+barcodes_keep <- intersect(meta_valid$barcode_full, colnames(merge.full))
+cat("Barcodes matched to Seurat object:", length(barcodes_keep),
+    "/", nrow(meta_valid), "\n")
+if (length(barcodes_keep) == 0) {
+  stop("No overlap between metadata barcode_full and merge.full colnames.\n",
+       "Check that meta_valid$Barcodes and meta_valid$sample_name ",
+       "match the structure of colnames(merge.full).")
+}
+
+obj_sub <- subset(merge.full, cells = barcodes_keep)
+
+# Extract log-normalised expression (genes x cells)
+expr <- GetAssayData(obj_sub, assay = "RNA", layer = "data")
+cat("Expression matrix:", nrow(expr), "genes x", ncol(expr), "cells\n")
+# Coerce to a Matrix::dgCMatrix so writeMM has a method
+expr_mat <- as(expr, "dgCMatrix")
+
+# Export as MatrixMarket format + barcode/feature lists
+metadata_dir <- dirname(metadata_tsv_path)
+out_dir <- file.path(metadata_dir, "expression_export")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+meta_export <- meta_valid[match(colnames(obj_sub), meta_valid$barcode_full), ]
+
+# ---------------------------------------------------------------------------
+# ADDED: carry sequencing depth through to the export so script 10 can test
+# the detection-depth confound (deeper bins detect more genes, which would
+# inflate every gene's correlation with stiffness in the same direction).
+# match() above aligns meta_export to colnames(obj_sub), so these two vectors
+# are already in the same order as the columns of obj_sub.
+# ---------------------------------------------------------------------------
+meta_export$nCount_RNA   <- obj_sub$nCount_RNA
+meta_export$nFeature_RNA <- obj_sub$nFeature_RNA
+
+Matrix::writeMM(expr_mat, file.path(out_dir, "step9_expression_matrix.mtx"))
+writeLines(colnames(expr), file.path(out_dir, "step9_expression_barcodes.txt"))
+writeLines(rownames(expr), file.path(out_dir, "step9_expression_features.txt"))
+write.table(meta_export,
+            file.path(out_dir, "step9_expression_metadata_matched.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("Export complete:", out_dir, "\n")
+#```
+
+# 2. Configuration: constants, helpers, plotting functions
+
+#step9_expression_barcodes.txt (barcodes / bins, one per column);
+#step9_expression_features.txt (gene names, one per row);
+#step9_expression_metadata_matched.tsv (metadata for the same ~96,000 bins,
+#including nanoindentation measurements, nCount_RNA and nFeature_RNA).
+
+## Config: constants, helpers, plotting functions
+
+#```{r DEG-GSEA-config}
+CONFIG_VERSION <- "2026-08-31_v1"   # bump whenever this chunk changes
+
+METADATA_TSV <- r"(Z:\Visium_Data\001_SpatialX\20260803_FinalAnnotatedMetadata\HTO_Combined_4um_Images\metadata\HTO_Combined_4um_Images_annotated_data.tsv)"
+OUTPUT_DIR   <- file.path(
+  r"(Z:\Visium_Data\001_SpatialX\20260803_FinalAnnotatedMetadata)",
+  "deg_gsea_outputs")
+
+TSV_BARCODE_COL  <- "Barcodes"
+TSV_SAMPLE_COL   <- "CaptureArea"
+TSV_CLUSTER_COL  <- "CellCluster"
+TSV_AGE_COL      <- "AgeGroup"
+TSV_TISSUE_COL   <- "Tissue-slices"
+
+# ---- post-hoc significance rules -------------------------------------------
+# These are NOT part of the DESeq2 null hypothesis. DESeq2 runs the ordinary
+# two-sided Wald test, H0: LFC = 0. These two values only draw the lines on the
+# volcano, colour the points, count DEGs and pick labels. Both directions are
+# always kept: LFC < -LFC_THRESHOLD is higher in Young, LFC > +LFC_THRESHOLD is
+# higher in Aged. Changing either value requires only the replot chunk.
+LFC_THRESHOLD <- 1        # dashed vertical lines at -1 and +1
+PADJ_CUTOFF   <- 0.05     # dashed horizontal line at -log10(0.05) = 1.301
+
+# Which LFC column the threshold is applied to, and which is plotted on x.
+#   "log2FoldChange"      apeglm posterior estimate. DESeq2's own
+#                         recommendation for visualisation and ranking.
+#   "log2FoldChange_mle"  the unshrunken MLE, the quantity the Wald test
+#                         actually tested. Use this if a reviewer objects to
+#                         thresholding a shrunken estimate.
+DEG_LFC_COL <- "log2FoldChange"
+
+MIN_CELLS_PER_SAMPLE <- 10
+
+GSEA_LE_JACCARD <- 0.5
+
+GSEA_MIN_SIZE <- 10
+GSEA_MAX_SIZE <- 500
+GSEA_NPERM    <- 10000
+
+# Pseudobulk gene filter. A gene is kept if it exceeds MIN_COUNT_PER_SAMPLE in
+# at least MIN_SAMPLES_DETECTED pseudobulk samples. (5, 2) is permissive: with
+# 8 animals a gene detected in only 2 of 8 survives, and genes near-zero in
+# every Young animal but present in two Aged animals land in the far tail of
+# the volcano with large |LFC| and large SE. Raising MIN_SAMPLES_DETECTED to
+# min(n_young, n_aged) removes that tail. Left at the original values so
+# nothing changes silently.
+MIN_COUNT_PER_SAMPLE <- 5
+MIN_SAMPLES_DETECTED <- 2
+
+# Save the fitted DESeqDataSet per test. Small (a few MB) and it means any
+# future change to LFC_THRESHOLD, PADJ_CUTOFF or figure style never requires
+# refitting. Set FALSE to skip.
+SAVE_DDS <- TRUE
+
+# ---- figure geometry and output formats ------------------------------------
+FIG_DPI     <- 600      # PNG resolution; SVG is vector so dpi is irrelevant there
+VOLCANO_W   <- 3.5      # = 7 / 2
+VOLCANO_H   <- 4.0      # = 6 * 2/3
+GSEA_DOT_W  <- 6.5      # pathway names are long; narrower is not readable
+VOLCANO_N_LABEL <- 15   # 20 labels in a 3.5 in panel collide badly
+
+VOLCANO_PANEL_MM <- list(
+  global      = c(w = 50.850, h = 51.892),
+  compartment = c(w = 30.648, h = 22.437)
+)
+VOLCANO_GLOBAL_LABELS <- c("Global_AllCompartments")
+
+VOLCANO_FONT_FAMILY <- "Arial"
+VOLCANO_FONT_PT     <- 6
+
+VOLCANO_MINOR_STEP    <- 1
+VOLCANO_STEP_SET      <- c(1, 2, 5, 10, 20, 25, 50, 100)
+VOLCANO_Y_MM_PER_TICK <- 5.0
+VOLCANO_X_MM_PER_TICK <- 5.5
+VOLCANO_TICK_MAJOR_MM <- 1.0
+VOLCANO_TICK_MINOR_MM <- 0.55
+VOLCANO_CANVAS_PAD_MM <- 1.0
+
+# Optional y ceiling in -log10(padj) units. NULL = no cap, the standard. If
+# set, genes above the ceiling are drawn AT the ceiling as filled triangles
+# rather than dropped, and the count is written into the figure caption.
+VOLCANO_Y_CAP <- NULL
+
+# Thin the grey NS cloud for SVG file size. NULL keeps every point. Silent
+# subsampling would misrepresent the figure, so this is off by default.
+VOLCANO_MAX_NS <- NULL
+
+# ---- matrisome masterlist ---------------------------------------------------
+# The volcano is drawn ONCE, with the matrisome layer already on it. There is
+# no separate matrisome replot chunk: plot_volcano takes matri_tbl and
+# run_deg_gsea passes it, so the manuscript figure comes out of the first run.
+MATRISOME_DIR     <- "Z:/Visium_Data/001_SpatialX"
+MATRISOME_PAT     <- "^Mm_Matrisome_Masterlist.*\\.csv$"
+MATRISOME_N_EACH  <- 10        # labelled genes per direction
+MATRISOME_RANK_BY <- "lfc"     # "lfc" = largest fold change, "padj" = smallest padj
+
+# Point colours, shared by the plain and the matrisome volcano so the two agree.
+VOLC_COLS <- c("Up in Aged"  = "#B57BEE",
+               "Up in Young" = "#007A7A",
+               "NS"          = "grey70")
+
+# -----------------------------------------------------------------------------
+# load_matrisome: read the Naba masterlist and return gene / division / category.
+# Column names are matched on a letters-only normalisation, so "Gene Symbol",
+# "Gene.Symbol" and "gene symbol" all resolve.
+# -----------------------------------------------------------------------------
+load_matrisome <- function(dir = MATRISOME_DIR, pattern = MATRISOME_PAT) {
+  mfile <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (!length(mfile)) {
+    message("[WARN] no file matching ", pattern, " in ", dir,
+            " - volcanoes will be drawn WITHOUT the matrisome layer")
+    return(NULL)
+  }
+  if (length(mfile) > 1)
+    message("[WARN] ", length(mfile), " matches; using ", basename(mfile[1]))
+  mfile <- mfile[1]
+
+  raw  <- read.csv(mfile, stringsAsFactors = FALSE, check.names = FALSE)
+  norm <- gsub("[^a-z]", "", tolower(names(raw)))
+  pick <- function(key) {
+    i <- which(norm == key); if (length(i)) names(raw)[i[1]] else NA_character_
+  }
+  gcol <- pick("genesymbol")
+  dcol <- pick("matrisomedivision")
+  ccol <- pick("matrisomecategory")
+  if (is.na(gcol))
+    stop("No 'Gene Symbol' column in ", basename(mfile), ". Columns: ",
+         paste(names(raw), collapse = ", "))
+
+  m <- data.frame(
+    gene               = trimws(as.character(raw[[gcol]])),
+    matrisome_division = if (!is.na(dcol)) as.character(raw[[dcol]]) else NA_character_,
+    matrisome_category = if (!is.na(ccol)) as.character(raw[[ccol]]) else NA_character_,
+    stringsAsFactors   = FALSE)
+  m <- m[nzchar(m$gene) & !is.na(m$gene), , drop = FALSE]
+  m <- m[!duplicated(m$gene), , drop = FALSE]
+
+  message("Matrisome masterlist: ", basename(mfile), " -> ", nrow(m),
+          " unique gene symbols")
+  if (!is.na(dcol) && !is.na(ccol))
+    print(table(m$matrisome_division, m$matrisome_category))
+  m
+}
+
+# =============================================================================
+# TEST DEFINITIONS
+# =============================================================================
+
+COMPARTMENT_TESTS <- list(
+  list(label      = "Follicle",
+       filter_col = "Compartments",
+       filter_vals = "F",
+       subdir     = "1_compartment"),
+  list(label      = "CL",
+       filter_col = "Compartments",
+       filter_vals = "CL",
+       subdir     = "1_compartment"),
+  list(label      = "Stroma",
+       filter_col = "Compartments",
+       filter_vals = "S",
+       subdir     = "1_compartment"),
+  list(label      = "Vascular",
+       filter_col = "Compartments",
+       filter_vals = "V",
+       subdir     = "1_compartment")
+)
+
+CLUSTER_TESTS <- list(
+  # Stroma sub-clusters
+  list(label      = "Stromal_Cyp17a1neg",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "Stromal_Cyp17a1neg",
+       subdir     = "2_cluster_stroma"),
+  list(label      = "Stromal_Theca_Cyp17a1pos",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "Stromal_Theca_Cyp17a1pos",
+       subdir     = "2_cluster_stroma"),
+  # Vascular / immune sub-clusters
+  list(label      = "SMC_Endo_Lyve1pos_Stroma",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "SMC_Endo_Lyve1pos_Stroma",
+       subdir     = "3_cluster_vascular_immune"),
+  list(label      = "Macrophage_Acta2pos",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "Macrophage_Acta2pos",
+       subdir     = "3_cluster_vascular_immune"),
+  list(label      = "Endo_Pericyte_Acta2pos_Vascular",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "Endo_Pericyte_Acta2pos_Vascular",
+       subdir     = "3_cluster_vascular_immune"),
+  list(label      = "Immune_TLS_Stroma",
+       filter_col = TSV_CLUSTER_COL,
+       filter_vals = "Immune_TLS_Stroma",
+       subdir     = "3_cluster_vascular_immune")
+)
+
+ALL_TESTS <- c(COMPARTMENT_TESTS, CLUSTER_TESTS)
+
+GLOBAL_TESTS <- list(
+  list(label       = "Global_AllCompartments",
+       filter_col  = "Compartments",
+       # listing the four values rather than using a catch-all also drops the
+       # handful of 'Unassigned' bins, which is what we want
+       filter_vals = c("F", "CL", "S", "V"),
+       subdir      = "0_global")
+)
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+# Ovary to animal. Six mice contributed a contralateral pair; four
+# contributed a single ovary. Grouping on ovary would treat the pairs as
+# independent replicates.
+OVARY_TO_ANIMAL <- c(
+  "Y1" = "mY_20Sep24", "Y2" = "mY_20Sep24",
+  "Y3" = "mY_16Sep24", "Y4" = "mY_16Sep24",
+  "Y5" = "mY_17Sep24", "Y6" = "mY_17Sep24",
+  "Y7" = "mY_20Nov23",
+  "Y8" = "mY_17Nov23",
+  "A1" = "mA_09Sep24", "A2" = "mA_09Sep24",
+  "A3" = "mA_06Sep24", "A4" = "mA_06Sep24",
+  "A5" = "mA_03Sep24", "A6" = "mA_03Sep24",
+  "A7" = "mA_25Oct23",
+  "A8" = "mA_26Oct23"
+)
+
+get_ovary_id <- function(tissue_slice) {
+  sub("-[0-9]+$", "", as.character(tissue_slice))
+}
+
+get_animal_id <- function(tissue_slice) {
+  ov  <- get_ovary_id(tissue_slice)
+  out <- unname(OVARY_TO_ANIMAL[ov])
+  if (any(is.na(out)))
+    stop("Ovary not in OVARY_TO_ANIMAL: ",
+         paste(unique(ov[is.na(out)]), collapse = ", "))
+  out
+}
+
+pseudobulk <- function(counts_mat, meta, group_cols) {
+  groups     <- do.call(paste, c(meta[group_cols], sep = "__"))
+  unique_grp <- unique(groups)
+  pb_list <- lapply(unique_grp, function(g) {
+    cells <- which(groups == g)
+    Matrix::rowSums(counts_mat[, cells, drop = FALSE])
+  })
+  pb_mat <- do.call(cbind, pb_list)
+  colnames(pb_mat) <- unique_grp
+  rownames(pb_mat) <- rownames(counts_mat)
+  return(pb_mat)
+}
+
+# -----------------------------------------------------------------------------
+# save_plot: every figure is written twice, PNG at FIG_DPI and SVG.
+# out_base is a path WITHOUT an extension, so a caller cannot write a .png
+# named .svg. svglite is preferred over grDevices::svg (no cairo dependency,
+# smaller files, selectable text). If SVG fails the PNG is still written.
+# -----------------------------------------------------------------------------
+save_plot <- function(p, out_base, width, height, dpi = FIG_DPI) {
+  out_base <- sub("\\.(png|svg|pdf)$", "", out_base, ignore.case = TRUE)
+  png_path <- paste0(out_base, ".png")
+  svg_path <- paste0(out_base, ".svg")
+
+  ggsave(png_path, p, width = width, height = height,
+         units = "in", dpi = dpi, bg = "white")
+
+  have_svglite <- requireNamespace("svglite", quietly = TRUE)
+  svg_ok <- tryCatch({
+    if (have_svglite) {
+      ggsave(svg_path, p, width = width, height = height,
+             units = "in", bg = "white", device = svglite::svglite)
+    } else {
+      ggsave(svg_path, p, width = width, height = height,
+             units = "in", bg = "white", device = "svg")
+    }
+    TRUE
+  }, error = function(e) {
+    message("  SVG export failed (", conditionMessage(e),
+            "). install.packages('svglite') is the usual fix.")
+    FALSE
+  })
+
+  sz <- function(f) if (file.exists(f))
+    paste0(round(file.size(f) / 1024), " KB") else "MISSING"
+  message("  wrote ", basename(png_path), " (", sz(png_path), ")",
+          if (svg_ok) paste0(" + ", basename(svg_path), " (", sz(svg_path), ")")
+          else " ; SVG NOT written")
+  invisible(c(png = png_path, svg = if (svg_ok) svg_path else NA_character_))
+}
+
+volcano_axis_ticks <- function(max_val,
+                               panel_mm,
+                               mm_per_tick = 5,
+                               step_set    = VOLCANO_STEP_SET,
+                               minor_step  = VOLCANO_MINOR_STEP,
+                               force_step  = NULL,
+                               force_limit = NULL) {
+
+  if (!is.finite(max_val) || max_val <= 0) max_val <- 1
+  max_ticks <- max(2, floor(panel_mm / mm_per_tick))
+
+  if (!is.null(force_step)) {
+    step  <- force_step
+    limit <- if (!is.null(force_limit)) force_limit else
+      ceiling(max_val / step) * step
+  } else {
+    cand <- lapply(step_set, function(s) {
+      lim <- ceiling(max_val / s) * s
+      list(step = s, limit = lim, n = lim / s)
+    })
+    cand <- Filter(function(x) x$n <= max_ticks, cand)
+    if (!length(cand)) {
+      step  <- step_set[which.min(abs(step_set - max_val))]
+      limit <- ceiling(max_val / step) * step
+    } else {
+      lims  <- vapply(cand, function(x) x$limit, numeric(1))
+      best  <- cand[[which.min(lims)]]
+      step  <- best$step
+      limit <- best$limit
+    }
+    if (!is.null(force_limit)) limit <- force_limit
+  }
+
+  major <- seq(0, limit, by = step)
+  minor <- if (minor_step > 0 && minor_step < step)
+    setdiff(seq(0, limit, by = minor_step), major) else numeric(0)
+
+  list(limit = limit, step = step, major = major, minor = minor)
+}
+
+volcano_axis_ticks_sym <- function(max_abs, panel_mm, ...) {
+  tk <- volcano_axis_ticks(max_abs, panel_mm = panel_mm / 2, ...)
+  list(limit = tk$limit,
+       step  = tk$step,
+       major = sort(unique(c(-tk$major, tk$major))),
+       minor = sort(unique(c(-tk$minor, tk$minor))))
+}
+
+fix_panel_size <- function(p, width_mm, height_mm) {
+  g <- ggplot2::ggplotGrob(p)
+  is_panel <- g$layout$name == "panel"
+  if (!any(is_panel)) stop("fix_panel_size: no 'panel' cell in the gtable")
+  g$widths[unique(g$layout$l[is_panel])]  <- grid::unit(width_mm,  "mm")
+  g$heights[unique(g$layout$t[is_panel])] <- grid::unit(height_mm, "mm")
+  g
+}
+
+grob_canvas_mm <- function(g, pad_mm = VOLCANO_CANVAS_PAD_MM) {
+  opened <- FALSE
+  if (is.null(grDevices::dev.list())) {
+    grDevices::pdf(NULL, width = 20, height = 20)
+    opened <- TRUE
+  }
+  on.exit(if (opened) grDevices::dev.off(), add = TRUE)
+  w <- grid::convertWidth(sum(g$widths),   "mm", valueOnly = TRUE)
+  h <- grid::convertHeight(sum(g$heights), "mm", valueOnly = TRUE)
+  if (!is.finite(w) || !is.finite(h))
+    stop("grob_canvas_mm: could not resolve the gtable size to mm")
+  c(w = w + pad_mm, h = h + pad_mm)
+}
+
+save_grob <- function(g, out_base, width_mm, height_mm, dpi = FIG_DPI) {
+  out_base <- sub("\\.(png|svg|pdf)$", "", out_base, ignore.case = TRUE)
+  png_path <- paste0(out_base, ".png")
+  svg_path <- paste0(out_base, ".svg")
+  w_in <- width_mm / 25.4
+  h_in <- height_mm / 25.4
+
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ragg::agg_png(png_path, width = w_in, height = h_in, units = "in",
+                  res = dpi, background = "white")
+  } else {
+    grDevices::png(png_path, width = w_in, height = h_in, units = "in",
+                   res = dpi, bg = "white", type = "cairo")
+  }
+  grid::grid.newpage(); grid::grid.draw(g); grDevices::dev.off()
+
+  svg_ok <- tryCatch({
+    if (requireNamespace("svglite", quietly = TRUE)) {
+      svglite::svglite(svg_path, width = w_in, height = h_in, bg = "white")
+    } else {
+      grDevices::svg(svg_path, width = w_in, height = h_in, bg = "white")
+    }
+    grid::grid.newpage(); grid::grid.draw(g); grDevices::dev.off()
+    TRUE
+  }, error = function(e) {
+    message("  SVG export failed (", conditionMessage(e),
+            "). install.packages('svglite') is the usual fix.")
+    if (length(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
+    FALSE
+  })
+
+  sz <- function(f) if (file.exists(f))
+    paste0(round(file.size(f) / 1024), " KB") else "MISSING"
+  message("  wrote ", basename(png_path), " (", sz(png_path), ")",
+          if (svg_ok) paste0(" + ", basename(svg_path), " (", sz(svg_path), ")")
+          else " ; SVG NOT written",
+          "  [canvas ", round(width_mm, 2), " x ", round(height_mm, 2), " mm]")
+  invisible(c(png = png_path, svg = if (svg_ok) svg_path else NA_character_))
+}
+
+# -----------------------------------------------------------------------------
+# plot_volcano
+#
+# y = -log10(padj). The log is in the QUANTITY, not in the axis scale, which is
+# why the ticks are evenly spaced at 0, 2.5, 5, 7.5. Each unit is one decade of
+# padj: y = 0 is padj 1, y = 1.301 is padj 0.05, y = 5 is padj 1e-5. This is
+# the universal volcano convention.
+#
+# x = log2FoldChange, symmetric limits so 0 sits at the centre of the panel.
+#
+# Thresholds are post-hoc. lfc_thr draws the two vertical lines and padj_thr
+# the horizontal one; a gene is coloured only if it clears both. Negative LFC
+# is "Up in Young", positive is "Up in Aged", so downregulation in Aged is
+# never dropped, it is the teal half of the plot.
+#
+# MATRISOME LAYER
+# Supply matri_tbl and every matrisome gene that is significant in EITHER
+# direction is redrawn as shape 21 with a black rim, and the top n_each per
+# direction are labelled. The colouring rule is identical either way, so the
+# plain and the matrisome figure agree gene for gene. This used to be a
+# separate replot chunk; it is folded in here so the first run produces the
+# manuscript figure with no second pass. matri_tbl = NULL reproduces the
+# original behaviour exactly, including the top-n_label-by-padj labelling.
+# -----------------------------------------------------------------------------
+plot_volcano <- function(res_df, title, out_base,
+                         lfc_thr   = LFC_THRESHOLD,
+                         padj_thr  = PADJ_CUTOFF,
+                         n_label   = VOLCANO_N_LABEL,
+                         lfc_col   = DEG_LFC_COL,
+                         y_cap     = VOLCANO_Y_CAP,
+                         scope     = c("auto", "global", "compartment"),
+                         panel_w_mm = NULL,
+                         panel_h_mm = NULL,
+                         x_step    = NULL,
+                         y_step    = NULL,
+                         x_limit   = NULL,
+                         y_limit   = NULL,
+                         minor_step  = VOLCANO_MINOR_STEP,
+                         font_pt     = VOLCANO_FONT_PT,
+                         font_family = VOLCANO_FONT_FAMILY,
+                         max_ns    = VOLCANO_MAX_NS,
+                         matri_tbl = NULL,
+                         n_each    = MATRISOME_N_EACH,
+                         rank_by   = MATRISOME_RANK_BY,
+                         write_gene_csv = TRUE) {
+
+  if (!"padj" %in% names(res_df))
+    stop("plot_volcano: 'padj' not in res_df")
+  if (!lfc_col %in% names(res_df))
+    stop("plot_volcano: column '", lfc_col, "' not in res_df")
+
+  scope <- match.arg(scope)
+  if (scope == "auto")
+    scope <- if (any(vapply(VOLCANO_GLOBAL_LABELS,
+                            function(k) grepl(k, out_base, fixed = TRUE),
+                            logical(1)))) "global" else "compartment"
+  pan <- VOLCANO_PANEL_MM[[scope]]
+  if (is.null(panel_w_mm)) panel_w_mm <- unname(pan["w"])
+  if (is.null(panel_h_mm)) panel_h_mm <- unname(pan["h"])
+
+  df <- as.data.frame(res_df)
+  df$lfc_plot <- df[[lfc_col]]
+  df <- df[!is.na(df$padj) & !is.na(df$lfc_plot), , drop = FALSE]
+  if (nrow(df) == 0) {
+    message("  volcano: no finite points, skipped")
+    return(invisible(NULL))
+  }
+
+  # -log10(0) is Inf and ggplot would drop it silently. DESeq2 can return
+  # padj == 0 through double underflow. Cap one decade below the smallest
+  # non-zero value and report how many genes were affected.
+  is_zero <- df$padj == 0
+  if (any(is_zero)) {
+    floor_p <- min(df$padj[!is_zero], na.rm = TRUE) / 10
+    message("  volcano: ", sum(is_zero), " gene(s) with padj == 0, ",
+            "capped at ", signif(floor_p, 3))
+    df$padj[is_zero] <- floor_p
+  }
+
+  df$neg_log10_padj <- -log10(df$padj)
+  df$sig <- dplyr::case_when(
+    df$padj < padj_thr & df$lfc_plot >=  lfc_thr ~ "Up in Aged",
+    df$padj < padj_thr & df$lfc_plot <= -lfc_thr ~ "Up in Young",
+    TRUE                                        ~ "NS")
+
+  # Sanity check. Under H0: LFC = 0 only a handful of genes should land at
+  # padj == 1. A large count here means a threshold test crept back in.
+  n_at_zero <- sum(df$neg_log10_padj == 0)
+  if (n_at_zero > 0.02 * nrow(df))
+    message("  [WARN] volcano: ", n_at_zero, " of ", nrow(df),
+            " genes at padj == 1 exactly. Expect a flat line at y = 0. ",
+            "Check that results() was called without lfcThreshold.")
+
+  # Optional y ceiling: keep the points, move them to the cap, mark them.
+  df$capped <- FALSE
+  if (!is.null(y_cap)) {
+    df$capped <- df$neg_log10_padj > y_cap
+    if (any(df$capped)) {
+      message("  volcano: ", sum(df$capped), " gene(s) above y = ", y_cap,
+              " drawn AT the cap as triangles")
+      df$neg_log10_padj[df$capped] <- y_cap
+    }
+  }
+
+  message("  volcano: ", sum(df$sig == "Up in Aged"), " up in Aged, ",
+          sum(df$sig == "Up in Young"), " up in Young ",
+          "(padj < ", padj_thr, ", |", lfc_col, "| > ", lfc_thr, ")")
+
+  n_ns <- sum(df$sig == "NS")
+  if (!is.null(max_ns) && n_ns > max_ns) {
+    set.seed(1)
+    drop_idx <- sample(which(df$sig == "NS"), n_ns - max_ns)
+    df <- df[-drop_idx, , drop = FALSE]
+    message("  volcano: NS points thinned ", n_ns, " -> ", max_ns,
+            ". THIS FIGURE IS SUBSAMPLED.")
+  }
+
+  # ---- matrisome selection ---------------------------------------------------
+  use_matri <- !is.null(matri_tbl) && nrow(as.data.frame(matri_tbl)) > 0
+  cand <- df[0, , drop = FALSE]
+  if (use_matri) {
+    if (!"gene" %in% names(df))
+      stop("plot_volcano: matri_tbl supplied but res_df has no 'gene' column")
+    df$is_matrisome <- df$gene %in% matri_tbl$gene
+    message("  matrisome genes in tested universe: ", sum(df$is_matrisome),
+            " of ", nrow(matri_tbl))
+    cand <- df[df$is_matrisome & df$sig != "NS", , drop = FALSE]
+    if (!nrow(cand)) {
+      message("  no significant matrisome genes; drawn without the ",
+              "matrisome layer")
+      use_matri <- FALSE
+    } else {
+      message("  outlined: ", nrow(cand), "  (",
+              sum(cand$sig == "Up in Aged"), " up in Aged, ",
+              sum(cand$sig == "Up in Young"), " up in Young)")
+    }
+  }
+
+  # ---- which genes get a text label ------------------------------------------
+  if (use_matri) {
+    # top n_each per direction among the OUTLINED genes, by |LFC| or by padj
+    ord_val <- if (rank_by == "padj") cand$padj else -abs(cand$lfc_plot)
+    cand <- cand[order(cand$sig, ord_val), , drop = FALSE]
+    top_genes <- do.call(rbind, lapply(split(cand, cand$sig),
+                                       function(s) head(s, n_each)))
+    message("  labelling ", nrow(top_genes), " matrisome genes, ranked by ",
+            if (rank_by == "padj") "padj" else "|log2FC|")
+  } else {
+    # Label the strongest genes on BOTH sides, not simply the smallest padj,
+    # which would otherwise fill every label slot from whichever direction
+    # happens to be more significant.
+    top_genes <- df %>%
+      dplyr::filter(sig != "NS") %>%
+      dplyr::group_by(sig) %>%
+      dplyr::arrange(padj, .by_group = TRUE) %>%
+      dplyr::slice_head(n = ceiling(n_label / 2)) %>%
+      dplyr::ungroup()
+  }
+
+  x_tk <- volcano_axis_ticks_sym(
+    max_abs     = max(abs(df$lfc_plot), na.rm = TRUE),
+    panel_mm    = panel_w_mm,
+    mm_per_tick = VOLCANO_X_MM_PER_TICK,
+    minor_step  = minor_step,
+    force_step  = x_step,
+    force_limit = x_limit)
+
+  y_max <- if (is.null(y_cap)) max(df$neg_log10_padj, na.rm = TRUE) else y_cap
+  y_tk <- volcano_axis_ticks(
+    max_val     = y_max,
+    panel_mm    = panel_h_mm,
+    mm_per_tick = VOLCANO_Y_MM_PER_TICK,
+    minor_step  = minor_step,
+    force_step  = y_step,
+    force_limit = y_limit)
+
+  message("  axes: x -", x_tk$limit, " to ", x_tk$limit, " by ", x_tk$step,
+          " | y 0 to ", y_tk$limit, " by ", y_tk$step,
+          " | minor ", if (minor_step > 0) minor_step else "off",
+          " | panel ", round(panel_w_mm, 3), " x ", round(panel_h_mm, 3),
+          " mm (", scope, ")")
+
+  # background layers exclude the outlined genes so nothing is drawn twice
+  df_ns  <- df[df$sig == "NS", , drop = FALSE]
+  df_sig <- if (use_matri)
+    df[df$sig != "NS" & !df$gene %in% cand$gene, , drop = FALSE] else
+    df[df$sig != "NS", , drop = FALSE]
+
+  cap_note <- if (!is.null(y_cap) && any(df$capped))
+    paste0(sum(df$capped), " gene(s) capped at y = ", y_cap,
+           " (triangles)") else NULL
+  matri_note <- if (use_matri)
+    paste0(nrow(cand), " matrisome DEGs outlined; top ", n_each,
+           " per direction labelled by ",
+           if (rank_by == "padj") "padj" else "|log2FC|") else NULL
+  caption <- paste(na.omit(c(matri_note, cap_note)), collapse = "; ")
+  if (!nzchar(caption)) caption <- NULL
+
+  chars_per_line <- max(16, floor(panel_w_mm / (0.55 * font_pt * 0.3528)))
+  title_wrapped  <- paste(strwrap(title, width = chars_per_line),
+                          collapse = "\n")
+  if (!is.null(caption))
+    caption <- paste(strwrap(caption, width = chars_per_line), collapse = "\n")
+
+  label_size_mm <- font_pt / .pt
+
+  has_minor <- utils::packageVersion("ggplot2") >= "3.5.0"
+  if (!has_minor && minor_step > 0)
+    message("  [NOTE] ggplot2 ", as.character(utils::packageVersion("ggplot2")),
+            " has no guide_axis(minor.ticks=); minor ticks omitted.")
+
+  p <- ggplot(mapping = aes(x = lfc_plot, y = neg_log10_padj)) +
+    geom_vline(xintercept = c(-lfc_thr, lfc_thr),
+               linetype = "dashed", colour = "grey40", linewidth = 0.25) +
+    geom_hline(yintercept = -log10(padj_thr),
+               linetype = "dashed", colour = "grey40", linewidth = 0.25) +
+    # NS underneath, significant on top, so colour is never hidden
+    geom_point(data = df_ns,  aes(colour = sig, shape = capped),
+               size = 0.45, alpha = 0.45, stroke = 0) +
+    geom_point(data = df_sig, aes(colour = sig, shape = capped),
+               size = 0.65, alpha = 0.85, stroke = 0)
+
+  if (use_matri)
+    # shape 21 takes the fill inside and a black rim outside
+    p <- p + geom_point(data = cand, aes(fill = sig),
+                        shape = 21, size = 0.85, stroke = 0.18,
+                        colour = "black")
+
+  p <- p +
+    geom_text_repel(data = top_genes, aes(label = gene, colour = sig),
+                    family = font_family, size = label_size_mm,
+                    fontface = if (use_matri) "bold" else "plain",
+                    max.overlaps = if (use_matri) 40 else 20, seed = 42,
+                    box.padding = if (use_matri) 0.22 else 0.18,
+                    point.padding = if (use_matri) 0.15 else 0.12,
+                    min.segment.length = 0.2, segment.size = 0.2,
+                    segment.colour = "grey45", show.legend = FALSE) +
+    scale_colour_manual(values = VOLC_COLS,
+                        breaks = c("Up in Young", "NS", "Up in Aged")) +
+    scale_fill_manual(values = VOLC_COLS, guide = "none") +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+    scale_x_continuous(breaks = x_tk$major, minor_breaks = x_tk$minor) +
+    scale_y_continuous(breaks = y_tk$major, minor_breaks = y_tk$minor) +
+    coord_cartesian(xlim = c(-x_tk$limit, x_tk$limit),
+                    ylim = c(0, y_tk$limit),
+                    expand = FALSE, clip = "off") +
+    labs(title   = title_wrapped,
+         x       = "log2 fold change (Aged / Young)",
+         y       = "-log10 adjusted p-value",
+         colour  = NULL,
+         caption = caption) +
+    guides(colour = guide_legend(nrow = 1,
+                                 override.aes = list(size = 1.6, alpha = 1)))
+
+  if (has_minor && minor_step > 0)
+    p <- p + guides(x = guide_axis(minor.ticks = TRUE),
+                    y = guide_axis(minor.ticks = TRUE))
+
+  p <- p +
+    theme_classic(base_size = font_pt, base_family = font_family) +
+    theme(text              = element_text(family = font_family,
+                                           size = font_pt),
+          plot.title        = element_text(hjust = 0.5, face = "bold",
+                                           size = font_pt),
+          plot.caption      = element_text(size = font_pt, colour = "grey35",
+                                           hjust = 0.5),
+          axis.title        = element_text(size = font_pt),
+          axis.text         = element_text(size = font_pt, colour = "black"),
+          axis.line         = element_line(linewidth = 0.25, colour = "black"),
+          axis.ticks        = element_line(linewidth = 0.25, colour = "black"),
+          axis.ticks.length = grid::unit(VOLCANO_TICK_MAJOR_MM, "mm"),
+          legend.position   = "top",
+          legend.text       = element_text(size = font_pt),
+          legend.key.size   = grid::unit(2.2, "mm"),
+          legend.margin     = margin(b = -2),
+          plot.margin       = margin(1, 2, 1, 1, unit = "mm"))
+
+  if (has_minor && minor_step > 0)
+    p <- p + theme(axis.minor.ticks.length =
+                     grid::unit(VOLCANO_TICK_MINOR_MM, "mm"))
+
+  g   <- fix_panel_size(p, width_mm = panel_w_mm, height_mm = panel_h_mm)
+  cvs <- grob_canvas_mm(g)
+  save_grob(g, out_base, width_mm = cvs["w"], height_mm = cvs["h"])
+
+  # the exact genes behind the outlined layer, for the figure legend
+  if (use_matri && write_gene_csv) {
+    out <- merge(cand, matri_tbl, by = "gene", all.x = TRUE)
+    out$labelled <- out$gene %in% top_genes$gene
+    want <- c("gene", "sig", "labelled", lfc_col, "padj", "pval",
+              "matrisome_division", "matrisome_category")
+    out <- out[order(out$sig, -abs(out$lfc_plot)),
+               want[want %in% names(out)], drop = FALSE]
+    write.csv(out, paste0(sub("\\.(png|svg|pdf)$", "", out_base), "_genes.csv"),
+              row.names = FALSE)
+  }
+  return(invisible(p))
+}
+
+# -----------------------------------------------------------------------------
+# tidy_pathway: MSigDB names are SCREAMING_SNAKE_CASE with a collection prefix.
+# -----------------------------------------------------------------------------
+tidy_pathway <- function(x, max_chars = 48) {
+  y <- sub("^(HALLMARK|GOBP|GOCC|GOMF|REACTOME|WP|KEGG|BIOCARTA|PID)_", "", x)
+  y <- tolower(gsub("_", " ", y))
+  y <- paste0(toupper(substr(y, 1, 1)), substr(y, 2, nchar(y)))
+  ifelse(nchar(y) > max_chars, paste0(substr(y, 1, max_chars - 3), "..."), y)
+}
+
+# -----------------------------------------------------------------------------
+# plot_gsea_dot
+#   x        = NES (negative = enriched in Young, positive = enriched in Aged)
+#   y        = pathway
+#   dot size = number of genes from the pathway present in the ranking
+#   colour   = statistical significance, -log10(padj)
+#
+# n_top LIMITS THE DRAWING ONLY. It selects how many pathway rows fit on the
+# panel; it has no effect on the enrichment test, which has already run over
+# every gene set. The full result, every pathway with its NES and padj, is in
+# GSEA_<label>_Aged_vs_Young.csv. Raise n_top or filter the CSV yourself if
+# you want more rows.
+# -----------------------------------------------------------------------------
+plot_gsea_dot <- function(gsea_res, title, out_base, n_top = 20,
+                          padj_thr = 0.05,
+                          independent_only = TRUE,
+                          width = GSEA_DOT_W) {
+  # fgsea returns a data.table; `$<-` on a data.table triggers shallow-copy
+  # warnings in some versions, so work on a plain data.frame here
+  df <- as.data.frame(gsea_res) %>% dplyr::filter(!is.na(padj), padj < padj_thr)
+
+  if (independent_only && "independent" %in% names(df) &&
+      any(df$independent %in% TRUE)) {
+    n_before <- nrow(df)
+    df <- dplyr::filter(df, independent %in% TRUE)
+    message("  dotplot: ", nrow(df), " independent of ", n_before,
+            " significant pathways")
+  }
+  if (nrow(df) == 0) {
+    message("  No significant GSEA pathways at padj < ", padj_thr)
+    return(invisible(NULL))
+  }
+  if (!"size" %in% names(df))
+    stop("plot_gsea_dot: fgsea 'size' column missing")
+
+  # take the strongest from each direction so the panel is not one-sided
+  df <- df %>%
+    dplyr::mutate(dir = ifelse(NES > 0, "Aged", "Young")) %>%
+    dplyr::group_by(dir) %>%
+    dplyr::slice_max(order_by = abs(NES), n = ceiling(n_top / 2),
+                     with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(pathway_label  = tidy_pathway(pathway),
+                  neg_log10_padj = -log10(padj)) %>%
+    dplyr::arrange(NES)
+  # truncation can collide two long names; make them distinct before factoring
+  df$pathway_label <- make.unique(df$pathway_label, sep = " ")
+  df$pathway_label <- factor(df$pathway_label, levels = df$pathway_label)
+
+  x_abs <- max(abs(df$NES), na.rm = TRUE)
+
+  p <- ggplot(df, aes(x = NES, y = pathway_label)) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               colour = "grey55", linewidth = 0.25) +
+    geom_segment(aes(x = 0, xend = NES,
+                     y = pathway_label, yend = pathway_label),
+                 colour = "grey85", linewidth = 0.25) +
+    geom_point(aes(size = size, fill = neg_log10_padj),
+                 shape = 21, colour = "black", stroke = 0.25) +
+    # fill is the mapped aesthetic (shape 21), so the scale must be a FILL
+    # scale. A colour scale here applies to nothing and ggplot silently falls
+    # back to its default blue fill gradient. Same viridis settings as the
+    # curated manuscript dot plot, so the automatic and the curated figure are
+    # visually interchangeable.
+    scale_fill_viridis_c(option = "C", direction = 1, begin = 0.05, end = 1,
+                         name = expression(-log[10]~italic(p)[adj])) +
+    scale_size_continuous(range = c(1.5, 6), name = "Genes in set") +
+    guides(size = guide_legend(override.aes = list(shape = 21,
+                                                   fill = "grey70",
+                                                   colour = "black"))) +
+    scale_x_continuous(limits = c(-x_abs, x_abs) * 1.08,
+                       expand = expansion(mult = 0)) +
+    labs(title = paste(strwrap(title, width = 60), collapse = "\n"),
+         x     = "Normalised Enrichment Score (NES)",
+         y     = NULL) +
+    theme_classic(base_size = 10) +
+    theme(plot.title      = element_text(hjust = 0.5, face = "bold", size = 10),
+          axis.text.y     = element_text(size = 7),
+          axis.text.x     = element_text(size = 8),
+          legend.position = "right",
+          legend.title    = element_text(size = 8),
+          legend.text     = element_text(size = 7),
+          legend.key.size = grid::unit(0.35, "cm"),
+          panel.grid.major.y = element_line(colour = "grey93",
+                                            linewidth = 0.2))
+
+  save_plot(p, out_base,
+            width  = width,
+            height = max(3.2, 0.24 * nrow(df) + 1.7))
+  return(invisible(p))
+}
+
+# =============================================================================
+# CORE DEG + GSEA RUNNER
+# =============================================================================
+
+summarise_leading_edge <- function(gsea_res, label, out_base,
+                                   padj_thr = 0.05,
+                                   jaccard  = GSEA_LE_JACCARD) {
+  if (!"leadingEdge" %in% names(gsea_res)) {
+    message("  leadingEdge absent; skipped"); return(invisible(NULL))
+  }
+  sig <- as.data.frame(gsea_res)
+  le  <- gsea_res$leadingEdge
+  keep <- !is.na(sig$padj) & sig$padj < padj_thr
+  sig <- sig[keep, , drop = FALSE]; le <- le[keep]
+  if (nrow(sig) == 0) {
+    message("  no significant pathways; skipped"); return(invisible(NULL))
+  }
+  ord <- order(sig$padj); sig <- sig[ord, , drop = FALSE]; le <- le[ord]
+
+  n <- nrow(sig); cluster <- rep(NA_integer_, n); k <- 0L
+  for (i in seq_len(n)) {
+    if (!is.na(cluster[i])) next
+    k <- k + 1L; cluster[i] <- k
+    if (i < n) for (j in (i + 1):n) {
+      if (!is.na(cluster[j])) next
+      a <- le[[i]]; b <- le[[j]]; u <- length(union(a, b))
+      if (u > 0 && length(intersect(a, b)) / u >= jaccard) cluster[j] <- k
+    }
+  }
+
+  summ <- do.call(rbind, lapply(seq_len(k), function(cc) {
+    idx <- which(cluster == cc); mem <- le[idx]
+    all_g <- unlist(mem); tab <- table(all_g)
+    core <- names(tab)[tab >= max(1, ceiling(length(idx) / 2))]
+    data.frame(le_cluster = cc, n_pathways = length(idx),
+               representative = sig$pathway[idx[1]],
+               rep_padj = sig$padj[idx[1]], rep_NES = sig$NES[idx[1]],
+               direction = sig$direction[idx[1]],
+               collections = paste(sort(unique(sig$collection[idx])),
+                                   collapse = "/"),
+               n_union_genes = length(unique(all_g)),
+               n_core_genes = length(core),
+               core_genes = paste(head(core, 40), collapse = "|"),
+               member_pathways = paste(sig$pathway[idx], collapse = "|"),
+               stringsAsFactors = FALSE)
+  }))
+  summ <- summ[order(-summ$n_pathways, summ$rep_padj), ]
+  write.csv(summ, file.path(out_base,
+            paste0("GSEA_leadingEdge_clusters_", label, ".csv")),
+            row.names = FALSE)
+
+  message("  ", label, ": ", k, " distinct signals behind ", n,
+          " significant pathways")
+  top <- head(summ, 3)
+  for (i in seq_len(nrow(top)))
+    message(sprintf("    [%3d pathways] %-44s NES %+0.2f %s",
+                    top$n_pathways[i],
+                    substr(tidy_pathway(top$representative[i], 44), 1, 44),
+                    top$rep_NES[i], top$direction[i]))
+  invisible(summ)
+}
+
+run_deg_gsea <- function(seu, meta, test_def, gene_sets,
+                          out_base, lfc_thr, padj_thr,
+                          min_cells) {
+  label      <- test_def$label
+  filter_col <- test_def$filter_col
+  filter_vals <- test_def$filter_vals
+
+  message("\n", paste(rep("-", 50), collapse = ""))
+  message("Test: ", label,
+          "  [", filter_col, " == ", paste(filter_vals, collapse = "/"), "]")
+
+  cell_mask  <- meta[[filter_col]] %in% filter_vals & !is.na(meta[[filter_col]])
+  test_cells <- rownames(meta)[cell_mask]
+
+  if (length(test_cells) < 50) {
+    message("  SKIPPED: fewer than 50 bins (n = ", length(test_cells), ")")
+    return(invisible(NULL))
+  }
+  message("  Bins: ", length(test_cells))
+
+  seu_sub   <- subset(seu, cells = test_cells)
+  meta_sub  <- seu_sub@meta.data
+  meta_sub$animal_id <- get_animal_id(meta_sub[[TSV_TISSUE_COL]])
+  meta_sub$age_group <- ifelse(
+    grepl("Young", meta_sub[[TSV_AGE_COL]], ignore.case = TRUE),
+    "Young", "Aged")
+
+  bin_tbl <- meta_sub %>%
+    group_by(animal_id, age_group) %>%
+    summarise(n_bins = n(), .groups = "drop") %>%
+    arrange(age_group, animal_id)
+  message("  Bin counts per animal:")
+  for (i in seq_len(nrow(bin_tbl))) {
+    message(sprintf("    %-10s  %-6s  %d bins",
+                    bin_tbl$animal_id[i],
+                    bin_tbl$age_group[i],
+                    bin_tbl$n_bins[i]))
+  }
+
+  counts <- LayerData(seu_sub, assay = "RNA", layer = "counts")
+  pb_mat  <- pseudobulk(counts, meta_sub,
+                         group_cols = c("animal_id", "age_group"))
+
+  pb_meta <- data.frame(
+    sample    = colnames(pb_mat),
+    animal_id = sub("__.*", "", colnames(pb_mat)),
+    age_group = sub(".*__", "", colnames(pb_mat)),
+    stringsAsFactors = FALSE)
+
+  cell_counts   <- table(
+    paste(meta_sub$animal_id, meta_sub$age_group, sep = "__"))
+  pb_meta$n_bins <- as.integer(cell_counts[pb_meta$sample])
+
+  keep    <- !is.na(pb_meta$n_bins) & pb_meta$n_bins >= min_cells
+  pb_mat  <- pb_mat[, keep, drop = FALSE]
+  pb_meta <- pb_meta[keep, ]
+
+  n_young <- sum(pb_meta$age_group == "Young")
+  n_aged  <- sum(pb_meta$age_group == "Aged")
+  message("  Pseudobulk samples after filter: Young=", n_young,
+          "  Aged=", n_aged)
+
+  if (n_young < 2 || n_aged < 2) {
+    message("  SKIPPED: need >=2 pseudobulk samples per group. ",
+            "Consider lowering MIN_CELLS_PER_SAMPLE or interpret with caution.")
+    write.csv(bin_tbl,
+              file.path(out_base, paste0("BinCounts_", label, ".csv")),
+              row.names = FALSE)
+    return(invisible(NULL))
+  }
+
+  keep_genes  <- rowSums(pb_mat > MIN_COUNT_PER_SAMPLE) >= MIN_SAMPLES_DETECTED
+  pb_mat_filt <- pb_mat[keep_genes, ]
+  message("  Genes after count filter (>", MIN_COUNT_PER_SAMPLE, " in >=",
+          MIN_SAMPLES_DETECTED, " of ", ncol(pb_mat), " samples): ",
+          nrow(pb_mat_filt))
+
+  pb_meta$age_group <- factor(pb_meta$age_group, levels = c("Young", "Aged"))
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(pb_mat_filt),
+    colData   = pb_meta,
+    design    = ~ age_group)
+  dds <- estimateSizeFactors(dds)
+  dds <- DESeq(dds, test = "Wald", fitType = "parametric", quiet = TRUE)
+
+  # ---------------------------------------------------------------------------
+  # Ordinary two-sided Wald test, H0: log2FoldChange = 0. No lfcThreshold, no
+  # altHypothesis. Genes higher in Young get a negative LFC and genes higher in
+  # Aged a positive one; both are tested and both appear in the output. The
+  # |LFC| > 1 and padj < 0.05 rules are applied afterwards, when plotting and
+  # counting, so they can be changed without refitting.
+  # ---------------------------------------------------------------------------
+  res <- results(dds,
+                 contrast = c("age_group", "Aged", "Young"),
+                 alpha    = padj_thr)
+
+  # apeglm shrinks the LFC for low-count genes. It requires the coef name
+  # rather than a contrast, and it drops the Wald 'stat' column, so the two
+  # frames are selected and renamed explicitly rather than joined by suffix.
+  coef_name <- resultsNames(dds)[grepl("age_group", resultsNames(dds))]
+  res_shrunk <- lfcShrink(dds, coef = coef_name, type = "apeglm", quiet = TRUE)
+
+  res_shr_df <- as.data.frame(res_shrunk) %>%
+    rownames_to_column("gene") %>%
+    dplyr::select(gene, baseMean, log2FoldChange, lfcSE)
+
+  res_std_df <- as.data.frame(res) %>%
+    rownames_to_column("gene") %>%
+    dplyr::select(gene,
+                  log2FoldChange_mle = log2FoldChange,
+                  lfcSE_mle          = lfcSE,
+                  stat, pvalue, padj)
+
+  # log2FoldChange      apeglm posterior estimate, plotted on x
+  # log2FoldChange_mle  unshrunken MLE, the quantity the Wald test tested
+  # stat                Wald statistic, used to rank genes for GSEA
+  # padj                BH adjusted Wald p-value, plotted on y
+  res_df <- res_shr_df %>%
+    dplyr::left_join(res_std_df, by = "gene") %>%
+    arrange(padj)
+
+  lfc_for_call <- res_df[[DEG_LFC_COL]]
+  n_up <- sum(res_df$padj < padj_thr & lfc_for_call >=  lfc_thr, na.rm = TRUE)
+  n_dn <- sum(res_df$padj < padj_thr & lfc_for_call <= -lfc_thr, na.rm = TRUE)
+  message("  DEGs (padj < ", padj_thr, " & |", DEG_LFC_COL, "| > ", lfc_thr,
+          "): ", n_up, " up in Aged, ", n_dn, " up in Young")
+  message("  padj < ", padj_thr, " regardless of LFC: ",
+          sum(res_df$padj < padj_thr, na.rm = TRUE))
+
+  write.csv(res_df,
+            file.path(out_base, paste0("DEG_", label, "_Aged_vs_Young.csv")),
+            row.names = FALSE)
+  write.csv(bin_tbl,
+            file.path(out_base, paste0("BinCounts_", label, ".csv")),
+            row.names = FALSE)
+  if (isTRUE(SAVE_DDS))
+    saveRDS(dds, file.path(out_base, paste0("dds_", label, ".rds")))
+
+  # Plain volcano, then the same figure with the matrisome layer. Both come out
+  # of this single run; there is no replot pass. matrisome_tbl is created by the
+  # data chunk and is NULL if the masterlist was not found, in which case the
+  # second call silently produces the plain figure again.
+  plot_volcano(res_df,
+    title    = paste0(label, ": Aged vs Young (DESeq2 pseudobulk)"),
+    out_base = file.path(out_base,
+                         paste0("Volcano_", label, "_Aged_vs_Young")),
+    lfc_thr  = lfc_thr,
+    padj_thr = padj_thr)
+
+  if (exists("matrisome_tbl") && !is.null(matrisome_tbl))
+    plot_volcano(res_df,
+      title     = paste0(label, ": matrisome, Aged vs Young"),
+      out_base  = file.path(out_base,
+                            paste0("Volcano-matrisome_", label,
+                                   "_Aged_vs_Young")),
+      lfc_thr   = lfc_thr,
+      padj_thr  = padj_thr,
+      matri_tbl = matrisome_tbl)
+
+  # ---------------------------------------------------------------------------
+  # GSEA operates on the COMPLETE ranked gene list, not on a DEG subset. Every
+  # gene that survived the pseudobulk count filter goes into rank_vec, ordered
+  # by the signed Wald statistic. That is what distinguishes GSEA from an
+  # over-representation test: it detects a coordinated shift in a gene set even
+  # when no individual member clears padj < 0.05 or |LFC| > 1.
+  #
+  # Consequently LFC_THRESHOLD and PADJ_CUTOFF do not enter GSEA at all.
+  # Changing them changes the volcano and the DEG list; it leaves every NES and
+  # every GSEA padj identical.
+  #
+  # If you want an enrichment test that DOES respect the threshold, that is
+  # over-representation analysis on the DEG list, a different question with a
+  # different null. The optional {r ORA-from-DEG} chunk at the end runs it.
+  # ---------------------------------------------------------------------------
+  rank_df <- res_df %>%
+    dplyr::filter(!is.na(stat), is.finite(stat)) %>%
+    dplyr::select(gene, stat)
+  if (any(duplicated(rank_df$gene)))
+    stop("Duplicate gene symbols in the ranking vector for test ", label)
+  rank_vec <- deframe(rank_df)
+
+  message("  GSEA ranking: ", length(rank_vec), " genes; ",
+          sum(rank_vec == 0), " exactly 0; range ",
+          paste(signif(range(rank_vec), 3), collapse = " to "))
+  if (sum(rank_vec == 0) > 0.1 * length(rank_vec))
+    message("  [WARN] more than 10% of the ranking is tied at 0.")
+
+  set.seed(42)
+  gsea_res <- fgsea(pathways    = gene_sets,
+                     stats       = rank_vec,
+                     minSize     = GSEA_MIN_SIZE,
+                     maxSize     = GSEA_MAX_SIZE,
+                     nPermSimple = GSEA_NPERM)
+  
+  if (nrow(gsea_res) == 0) {
+    message("  no gene set inside the size window ", GSEA_MIN_SIZE,
+            " to ", GSEA_MAX_SIZE, "; nothing tested")
+    return(list(deg = res_df, gsea = data.frame(
+      pathway = character(0), pval = numeric(0), padj = numeric(0),
+      ES = numeric(0), NES = numeric(0), size = integer(0),
+      direction = character(0), collection = character(0),
+      independent = logical(0), stringsAsFactors = FALSE)))
+  }
+  
+  gsea_res <- gsea_res %>%
+    arrange(padj) %>%
+    mutate(direction = ifelse(NES > 0, "Up in Aged", "Up in Young"))
+
+  gsea_res$collection <- unname(gene_set_source[gsea_res$pathway])
+
+  # GO:BP is deeply nested, so a parent term and its children fire together.
+  # collapsePathways flags a non-redundant subset. Nothing is discarded: the
+  # CSV keeps every pathway, with independent = TRUE on the retained ones.
+  gsea_res$independent <- NA
+  sig_dt <- data.table::as.data.table(gsea_res)[padj < 0.05][order(pval)]
+  if (nrow(sig_dt) > 1) {
+    keep <- tryCatch(
+      fgsea::collapsePathways(sig_dt, gene_sets, rank_vec)$mainPathways,
+      error = function(e) {
+        message("  collapsePathways failed (", conditionMessage(e),
+                "); leaving independent = NA")
+        NULL
+      })
+    if (!is.null(keep)) {
+      gsea_res$independent <- gsea_res$pathway %in% keep
+      message("  Independent pathways after collapsing: ", length(keep),
+              " of ", nrow(sig_dt), " significant")
+    }
+  }
+
+  gsea_out <- as.data.frame(gsea_res)
+  gsea_out$leadingEdge <- vapply(gsea_res$leadingEdge,
+                                 function(v) paste(v, collapse = "|"),
+                                 character(1))
+  write.csv(gsea_out,
+            file.path(out_base, paste0("GSEA_", label, "_Aged_vs_Young.csv")),
+            row.names = FALSE)
+
+  summarise_leading_edge(gsea_res, label, out_base)
+
+  message("  Significant GSEA pathways (padj<0.05): ",
+          sum(gsea_res$padj < 0.05, na.rm = TRUE),
+          "  (", sum(gsea_res$padj < 0.05 & gsea_res$NES > 0, na.rm = TRUE),
+          " up in Aged, ",
+          sum(gsea_res$padj < 0.05 & gsea_res$NES < 0, na.rm = TRUE),
+          " up in Young)")
+
+  plot_gsea_dot(gsea_res,
+    title    = paste0(label, ": GSEA Aged vs Young"),
+    out_base = file.path(out_base,
+                         paste0("GSEA_dotplot_", label, "_Aged_vs_Young")))
+
+  return(list(deg = res_df, gsea = gsea_res))
+}
+
+# =============================================================================
+# CROSS-TEST SUMMARY, factored out so any chunk can rebuild it
+# =============================================================================
+
+write_cross_test_summaries <- function(all_results, output_dir) {
+  if (length(all_results) == 0) {
+    message("No results to summarise.")
+    return(invisible(NULL))
+  }
+  message("Tests in all_results: ", paste(names(all_results), collapse = ", "))
+
+  # all_results lives for the whole R session. A result computed under an older
+  # version of this config chunk therefore survives a re-run of the test loop
+  # and lands here with a different column set, which used to abort the summary
+  # with "Column `log2FoldChange_mle` doesn't exist". Drop such entries by name
+  # rather than failing, so the tests that ARE current still get summarised.
+  .needed_deg <- c("gene", "baseMean", "log2FoldChange", "log2FoldChange_mle",
+                   "pvalue", "padj")
+  .ok <- vapply(all_results, function(r) {
+    !is.null(r$deg) && all(.needed_deg %in% names(r$deg))
+  }, logical(1))
+  if (any(!.ok)) {
+    message("[STALE, DROPPED] computed under an older config: ",
+            paste(names(all_results)[!.ok], collapse = ", "))
+    message("  Re-run those tests to include them in the summary.")
+    all_results <- all_results[.ok]
+  }
+  if (length(all_results) == 0) {
+    message("Nothing current left to summarise.")
+    return(invisible(NULL))
+  }
+
+  deg_summary <- bind_rows(lapply(names(all_results), function(lbl) {
+    d <- all_results[[lbl]]$deg
+    d$lfc_call <- d[[DEG_LFC_COL]]
+    d %>%
+      filter(padj < PADJ_CUTOFF, abs(lfc_call) >= LFC_THRESHOLD) %>%
+      mutate(test      = lbl,
+             direction = ifelse(lfc_call > 0, "Up_Aged", "Up_Young")) %>%
+      dplyr::select(test, gene, baseMean, log2FoldChange, log2FoldChange_mle,
+                    pvalue, padj, direction)
+  }))
+  write.csv(deg_summary, file.path(output_dir, "DEG_summary_all_tests.csv"),
+            row.names = FALSE)
+  message("DEG summary rows: ", nrow(deg_summary),
+          "  (", sum(deg_summary$direction == "Up_Aged"), " Up_Aged, ",
+          sum(deg_summary$direction == "Up_Young"), " Up_Young)")
+
+  gsea_summary <- bind_rows(lapply(names(all_results), function(lbl) {
+    all_results[[lbl]]$gsea %>%
+      filter(padj < 0.05) %>%
+      mutate(test = lbl) %>%
+      dplyr::select(test, pathway, NES, padj, direction,
+                    dplyr::any_of(c("size", "collection", "independent")))
+  }))
+  write.csv(gsea_summary, file.path(output_dir, "GSEA_summary_all_tests.csv"),
+            row.names = FALSE)
+
+  shared <- gsea_summary %>%
+    group_by(pathway) %>%
+    summarise(n_tests    = n_distinct(test),
+              tests      = paste(test, collapse = ", "),
+              mean_NES   = mean(NES),
+              consistent = n_distinct(direction) == 1,
+              .groups = "drop") %>%
+    filter(n_tests >= 2) %>%
+    arrange(desc(n_tests), desc(abs(mean_NES)))
+  write.csv(shared,
+            file.path(output_dir, "GSEA_shared_pathways_across_tests.csv"),
+            row.names = FALSE)
+
+  message("Shared pathways (>=2 tests): ", nrow(shared))
+  invisible(list(deg = deg_summary, gsea = gsea_summary, shared = shared))
+}
+
+# -----------------------------------------------------------------------------
+# rebuild_summaries_from_csv: same three summary tables, but read back from the
+# DEG_*.csv / GSEA_*.csv already on disk instead of from `all_results` in
+# memory. This is what makes a threshold change a replot-only operation: the
+# per-gene statistics never change, so re-applying LFC_THRESHOLD and
+# PADJ_CUTOFF to the saved files reproduces the summaries without refitting.
+# Files written before CONFIG_VERSION 2026-08-05_v3 are skipped, not silently
+# re-thresholded, because their padj came from a different null.
+# -----------------------------------------------------------------------------
+rebuild_summaries_from_csv <- function(root_dir, output_dir = OUTPUT_DIR) {
+  deg_files <- list.files(root_dir, pattern = "^DEG_.*_Aged_vs_Young\\.csv$",
+                          recursive = TRUE, full.names = TRUE)
+  gsea_files <- list.files(root_dir, pattern = "^GSEA_.*_Aged_vs_Young\\.csv$",
+                           recursive = TRUE, full.names = TRUE)
+  message("Rebuilding summaries from ", length(deg_files), " DEG and ",
+          length(gsea_files), " GSEA CSVs in ", root_dir)
+
+  deg_summary <- bind_rows(lapply(deg_files, function(f) {
+    d   <- read.csv(f, stringsAsFactors = FALSE)
+    lbl <- sub("^DEG_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+    if (!"log2FoldChange_mle" %in% names(d) || "padj_lfcthr" %in% names(d)) {
+      message("  [STALE, SKIPPED] ", basename(f))
+      return(NULL)
+    }
+    d$lfc_call <- d[[DEG_LFC_COL]]
+    d %>%
+      filter(!is.na(padj), padj < PADJ_CUTOFF,
+             abs(lfc_call) >= LFC_THRESHOLD) %>%
+      mutate(test      = lbl,
+             direction = ifelse(lfc_call > 0, "Up_Aged", "Up_Young")) %>%
+      dplyr::select(test, gene, baseMean, log2FoldChange, log2FoldChange_mle,
+                    pvalue, padj, direction)
+  }))
+  write.csv(deg_summary, file.path(output_dir, "DEG_summary_all_tests.csv"),
+            row.names = FALSE)
+  message("  DEG summary rows: ", nrow(deg_summary),
+          "  (padj < ", PADJ_CUTOFF, ", |", DEG_LFC_COL, "| > ",
+          LFC_THRESHOLD, ")")
+  if (nrow(deg_summary) > 0)
+    print(table(deg_summary$test, deg_summary$direction))
+
+  gsea_summary <- bind_rows(lapply(gsea_files, function(f) {
+    g   <- read.csv(f, stringsAsFactors = FALSE)
+    lbl <- sub("^GSEA_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+    if (!all(c("pathway", "NES", "padj") %in% names(g))) return(NULL)
+    g %>%
+      filter(!is.na(padj), padj < 0.05) %>%
+      mutate(test = lbl,
+             direction = ifelse(NES > 0, "Up in Aged", "Up in Young")) %>%
+      dplyr::select(test, pathway, NES, padj, direction,
+                    dplyr::any_of(c("size", "collection", "independent")))
+  }))
+  write.csv(gsea_summary, file.path(output_dir, "GSEA_summary_all_tests.csv"),
+            row.names = FALSE)
+
+  shared <- gsea_summary %>%
+    group_by(pathway) %>%
+    summarise(n_tests    = n_distinct(test),
+              tests      = paste(test, collapse = ", "),
+              mean_NES   = mean(NES),
+              consistent = n_distinct(direction) == 1,
+              .groups = "drop") %>%
+    filter(n_tests >= 2) %>%
+    arrange(desc(n_tests), desc(abs(mean_NES)))
+  write.csv(shared,
+            file.path(output_dir, "GSEA_shared_pathways_across_tests.csv"),
+            row.names = FALSE)
+  message("  Shared pathways (>=2 tests): ", nrow(shared))
+
+  invisible(list(deg = deg_summary, gsea = gsea_summary, shared = shared))
+}
+
+# =============================================================================
+# STALENESS GUARD
+# Fails loudly if the session holds an older version of this config chunk,
+# which is the exact failure mode of running a single chunk after editing.
+# =============================================================================
+
+assert_config_current <- function(expect_version = "2026-08-31_v1") {
+  need_objs <- c("run_deg_gsea", "summarise_leading_edge", 
+                 "plot_volcano", "plot_gsea_dot", "save_plot",
+                 "write_cross_test_summaries", "rebuild_summaries_from_csv",
+                 "tidy_pathway", "load_matrisome", "VOLC_COLS",
+                 "MATRISOME_N_EACH", "MATRISOME_RANK_BY",
+                 "GSEA_MIN_SIZE", "GSEA_MAX_SIZE", "GSEA_NPERM",
+                 "LFC_THRESHOLD", "PADJ_CUTOFF", "DEG_LFC_COL",
+                 "MIN_CELLS_PER_SAMPLE", "MIN_COUNT_PER_SAMPLE",
+                 "MIN_SAMPLES_DETECTED", "OUTPUT_DIR", "FIG_DPI",
+                 "VOLCANO_W", "VOLCANO_H")
+  miss <- need_objs[!vapply(need_objs, exists, logical(1))]
+  if (length(miss))
+    stop("Run the {r DEG-GSEA-config} chunk first. Missing: ",
+         paste(miss, collapse = ", "))
+
+  if (!exists("CONFIG_VERSION") || !identical(CONFIG_VERSION, expect_version))
+    stop("Config in the session is version '",
+         if (exists("CONFIG_VERSION")) CONFIG_VERSION else "<none>",
+         "' but this chunk expects '", expect_version,
+         "'. Re-run {r DEG-GSEA-config}.")
+
+  # Signature checks: catch a stale definition that shares a name.
+  if (!"out_base" %in% names(formals(plot_volcano)))
+    stop("plot_volcano in this session is an OLD version (takes out_path). ",
+         "Re-run {r DEG-GSEA-config}.")
+  if (!"matri_tbl" %in% names(formals(plot_volcano)))
+    stop("plot_volcano in this session predates the merged matrisome layer. ",
+         "Re-run {r DEG-GSEA-config}.")
+  body_txt <- paste(deparse(body(run_deg_gsea)), collapse = " ")
+  if (grepl("lfcThreshold", body_txt))
+    stop("run_deg_gsea in this session still calls results() with ",
+         "lfcThreshold. Re-run {r DEG-GSEA-config}.")
+
+  message("Config OK: ", CONFIG_VERSION,
+          " | H0: LFC = 0 (two-sided Wald)",
+          " | lines at |LFC| > ", LFC_THRESHOLD,
+          " and padj < ", PADJ_CUTOFF,
+          " | threshold applied to ", DEG_LFC_COL,
+          " | volcano ", VOLCANO_W, " x ", VOLCANO_H, " in @ ", FIG_DPI,
+          " dpi | svglite ",
+          if (requireNamespace("svglite", quietly = TRUE)) "yes" else "NO")
+  invisible(TRUE)
+}
+
+message("Config loaded: ", CONFIG_VERSION)
+#```
+
+# 3. Data: metadata merge, gene sets, matrisome
+
+#```{r DEG-GSEA-data}
+assert_config_current()
+
+if (!exists("merge.full"))
+  stop("merge.full not in the session. Run the export chunk, or readRDS it.")
+
+message("\n=== Loading Seurat RDS ===")
+seu <- merge.full
+
+message("\n=== Loading metadata TSV ===")
+tsv <- read.delim(METADATA_TSV, sep = "\t",
+                   stringsAsFactors = FALSE, check.names = FALSE)
+
+required_cols <- c(TSV_BARCODE_COL, TSV_SAMPLE_COL,
+                    TSV_CLUSTER_COL, TSV_AGE_COL, TSV_TISSUE_COL)
+missing_cols  <- required_cols[!required_cols %in% colnames(tsv)]
+if (length(missing_cols) > 0)
+  stop("Missing TSV columns: ", paste(missing_cols, collapse = ", "))
+
+tsv$barcode_full <- paste0(tsv[[TSV_BARCODE_COL]], ".", tsv[[TSV_SAMPLE_COL]])
+tsv_sub <- tsv[!duplicated(tsv$barcode_full),
+                c("barcode_full", TSV_CLUSTER_COL,
+                  TSV_AGE_COL, TSV_TISSUE_COL, "Compartments")]
+rownames(tsv_sub) <- tsv_sub$barcode_full
+tsv_sub$barcode_full <- NULL
+
+n_overlap <- sum(rownames(tsv_sub) %in% colnames(seu))
+message("Barcodes matched: ", n_overlap, " / ", nrow(tsv_sub))
+if (n_overlap < 100)
+  stop("Very few barcode matches — check format. ",
+       "TSV: ", rownames(tsv_sub)[1],
+       "  Seurat: ", colnames(seu)[1])
+
+seu <- AddMetaData(seu, metadata = tsv_sub)
+
+message("\nBins per compartment (from Compartments column):")
+print(table(seu@meta.data[["Compartments"]], useNA = "ifany"))
+message("\nBins per age group:")
+print(table(seu@meta.data[[TSV_AGE_COL]], useNA = "ifany"))
+
+meta <- seu@meta.data
+
+# =============================================================================
+# LOAD GENE SETS
+# db_species = "MM" reads the mouse-native MSigDB (2026.1.Mm) directly, with no
+# human-to-mouse ortholog mapping. The mouse database has NO KEGG collection,
+# so Reactome replaces the CP:KEGG sets used previously.
+# Collections are M-prefixed: MH = Hallmark, M2 = curated, M5 = GO.
+#
+# ALL FIVE COLLECTIONS ARE LOADED HERE. GO:CC and GO:MF used to be added by a
+# separate re-run chunk that overwrote the GSEA CSVs afterwards; they are loaded
+# up front instead, so the first run tests the family the curation was built on.
+# This matters for more than convenience: BH correction is applied across the
+# whole tested family, so the padj of a Hallmark set depends on how many GO sets
+# were tested alongside it. Loading all five at once is the only way the padj in
+# the figures and the padj in the curated tables are the same number.
+# =============================================================================
+
+message("\n=== Loading MSigDB gene sets (mouse-native) ===")
+
+GSEA_COLLECTIONS <- list(
+  list(coll = "MH", sub = NULL,          name = "Hallmark"),
+  list(coll = "M5", sub = "GO:BP",       name = "GO:BP"),
+  list(coll = "M5", sub = "GO:CC",       name = "GO:CC"),
+  list(coll = "M5", sub = "GO:MF",       name = "GO:MF"),
+  list(coll = "M2", sub = "CP:REACTOME", name = "Reactome")
+)
+
+gene_sets <- list(); gene_set_source <- character(0)
+for (cc in GSEA_COLLECTIONS) {
+  args <- list(db_species = "MM", species = "Mus musculus",
+               collection = cc$coll)
+  if (!is.null(cc$sub)) args$subcollection <- cc$sub
+  tbl <- do.call(msigdbr::msigdbr, args)
+  stopifnot(nrow(tbl) > 0)
+  gs  <- lapply(split(tbl$gene_symbol, tbl$gs_name), unique)
+  # a set name appearing in two collections would otherwise be tested twice
+  dup <- intersect(names(gs), names(gene_sets))
+  if (length(dup))
+    message("  [WARN] ", length(dup), " duplicate set names from ", cc$name,
+            " dropped")
+  gs <- gs[setdiff(names(gs), names(gene_sets))]
+  message(sprintf("  %-10s %5d sets", cc$name, length(gs)))
+  gene_sets       <- c(gene_sets, gs)
+  gene_set_source <- c(gene_set_source,
+                       setNames(rep(cc$name, length(gs)), names(gs)))
+}
+message("Gene sets total: ", length(gene_sets))
+if (!length(gene_sets)) stop("No gene sets loaded; check collection names.")
+
+.chk <- msigdbr::msigdbr(db_species = "MM", species = "Mus musculus",
+                         collection = "MH")
+message("db_version: ", .chk$db_version[1],
+        "   (expect 2026.1.Mm; ortholog columns present: ",
+        any(grepl("ortholog", names(.chk))), ")")
+
+# =============================================================================
+# MATRISOME MASTERLIST
+# Loaded here so run_deg_gsea can hand it straight to plot_volcano.
+# =============================================================================
+matrisome_tbl <- load_matrisome()
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+if (!exists("all_results")) all_results <- list()
+#```
+
+# 4. Run: compartment and cluster tests
+
+#```{r DEG-GSEA-run}
+assert_config_current()
+if (!exists("gene_sets") || !exists("meta"))
+  stop("Run the {r DEG-GSEA-data} chunk first.")
+
+# Start from a clean slate. all_results persists for the whole R session, so a
+# result computed under an older config chunk would otherwise survive here and
+# break or silently contaminate the cross-test summaries. The global chunk
+# appends to whatever this loop leaves behind.
+if (exists("all_results") && length(all_results) > 0)
+  message("Clearing ", length(all_results), " previous result(s): ",
+          paste(names(all_results), collapse = ", "))
+all_results <- list()
+
+for (test_def in ALL_TESTS) {
+  out_dir_test <- file.path(OUTPUT_DIR, test_def$subdir)
+  dir.create(out_dir_test, showWarnings = FALSE, recursive = TRUE)
+
+  result <- run_deg_gsea(
+    seu       = seu,
+    meta      = meta,
+    test_def  = test_def,
+    gene_sets = gene_sets,
+    out_base  = out_dir_test,
+    lfc_thr   = LFC_THRESHOLD,
+    padj_thr  = PADJ_CUTOFF,
+    min_cells = MIN_CELLS_PER_SAMPLE)
+
+  if (!is.null(result))
+    all_results[[test_def$label]] <- result
+}
+
+message("\n=== Cross-test DEG summary ===")
+write_cross_test_summaries(all_results, OUTPUT_DIR)
+message("\nAll outputs saved to: ", OUTPUT_DIR)
+message("Done.")
+#```
+
+# 5. Run: global pooled test
+
+
+#Safe to run on its own, provided chunks 2 and 3 have been run in this
+#session.
+
+#```{r DEG-GSEA-global}
+assert_config_current()
+if (!exists("gene_sets") || !exists("meta"))
+  stop("Run the {r DEG-GSEA-data} chunk first.")
+if (!exists("all_results")) all_results <- list()
+
+message("\n", paste(rep("=", 60), collapse = ""))
+message("GLOBAL Young vs Aged")
+message(paste(rep("=", 60), collapse = ""))
+
+.n_global <- sum(meta[["Compartments"]] %in% c("F", "CL", "S", "V"),
+                 na.rm = TRUE)
+message("Bins entering the global test: ", format(.n_global, big.mark = ","))
+message("This subset is larger than any single compartment. If R runs out of ",
+        "memory here,\nthe likely culprit is subset(seu, ...) rather than DESeq2.")
+
+for (test_def in GLOBAL_TESTS) {
+  out_dir_test <- file.path(OUTPUT_DIR, test_def$subdir)
+  dir.create(out_dir_test, showWarnings = FALSE, recursive = TRUE)
+
+  result <- run_deg_gsea(
+    seu       = seu,
+    meta      = meta,
+    test_def  = test_def,
+    gene_sets = gene_sets,
+    out_base  = out_dir_test,
+    lfc_thr   = LFC_THRESHOLD,
+    padj_thr  = PADJ_CUTOFF,
+    min_cells = MIN_CELLS_PER_SAMPLE)
+
+  if (!is.null(result))
+    all_results[[test_def$label]] <- result
+}
+
+# Rebuild the summaries. NOTE: if only this chunk was run in the session,
+# all_results holds the global test alone and the two summary CSVs are
+# OVERWRITTEN with global-only content. The message lists what went in.
+message("\n=== Rebuilding cross-test summaries ===")
+.summ <- write_cross_test_summaries(all_results, OUTPUT_DIR)
+deg_summary  <- .summ$deg
+gsea_summary <- .summ$gsea
+
+# =============================================================================
+# GLOBAL vs COMPARTMENT: what does pooling reveal, and what does it hide
+# =============================================================================
+
+GLOBAL_LABEL    <- "Global_AllCompartments"
+COMPARTMENT_LBL <- c("Follicle", "CL", "Stroma", "Vascular")
+.comp_present   <- intersect(COMPARTMENT_LBL, names(all_results))
+
+if (GLOBAL_LABEL %in% names(all_results) && length(.comp_present) > 0) {
+
+  g_deg <- deg_summary %>% filter(test == GLOBAL_LABEL)    %>% pull(gene) %>% unique()
+  c_deg <- deg_summary %>% filter(test %in% .comp_present) %>% pull(gene) %>% unique()
+
+  deg_cmp <- tibble(
+    category = c("global only", "shared", "compartment only"),
+    n_genes  = c(length(setdiff(g_deg, c_deg)),
+                 length(intersect(g_deg, c_deg)),
+                 length(setdiff(c_deg, g_deg))))
+
+  message("\n--- DEGs: global vs compartment-stratified ---")
+  for (i in seq_len(nrow(deg_cmp)))
+    message(sprintf("   %-18s %d", deg_cmp$category[i], deg_cmp$n_genes[i]))
+  message("   'global only' genes are candidates for a COMPOSITIONAL shift:")
+  message("   they emerge from pooling but are not significant within any")
+  message("   single compartment.")
+
+  g_gs <- gsea_summary %>% filter(test == GLOBAL_LABEL)    %>% pull(pathway) %>% unique()
+  c_gs <- gsea_summary %>% filter(test %in% .comp_present) %>% pull(pathway) %>% unique()
+
+  gsea_cmp <- tibble(
+    category   = c("global only", "shared", "compartment only"),
+    n_pathways = c(length(setdiff(g_gs, c_gs)),
+                   length(intersect(g_gs, c_gs)),
+                   length(setdiff(c_gs, g_gs))))
+
+  message("\n--- GSEA pathways: global vs compartment-stratified ---")
+  for (i in seq_len(nrow(gsea_cmp)))
+    message(sprintf("   %-18s %d", gsea_cmp$category[i], gsea_cmp$n_pathways[i]))
+
+  deg_detail <- tibble(gene = union(g_deg, c_deg)) %>%
+    mutate(in_global      = gene %in% g_deg,
+           in_compartment = gene %in% c_deg,
+           category = dplyr::case_when(
+             in_global & !in_compartment ~ "global only",
+             in_global &  in_compartment ~ "shared",
+             TRUE                        ~ "compartment only")) %>%
+    arrange(category, gene)
+  write.csv(deg_detail,
+            file.path(OUTPUT_DIR, "DEG_global_vs_compartment.csv"),
+            row.names = FALSE)
+
+  gsea_detail <- tibble(pathway = union(g_gs, c_gs)) %>%
+    mutate(in_global      = pathway %in% g_gs,
+           in_compartment = pathway %in% c_gs,
+           category = dplyr::case_when(
+             in_global & !in_compartment ~ "global only",
+             in_global &  in_compartment ~ "shared",
+             TRUE                        ~ "compartment only")) %>%
+    arrange(category, pathway)
+  write.csv(gsea_detail,
+            file.path(OUTPUT_DIR, "GSEA_global_vs_compartment.csv"),
+            row.names = FALSE)
+
+  message("\nSaved: DEG_global_vs_compartment.csv")
+  message("Saved: GSEA_global_vs_compartment.csv")
+
+} else if (!GLOBAL_LABEL %in% names(all_results)) {
+  message("\n[WARN] the global test produced no result, so the ",
+          "global-vs-compartment comparison was skipped.")
+} else {
+  message("\n[WARN] no compartment tests in all_results, so the ",
+          "global-vs-compartment comparison was skipped. Run ",
+          "{r DEG-GSEA-run} in this session first if you want it.")
+}
+
+message("\nAll outputs saved to: ", OUTPUT_DIR)
+message("Done.")
+#```
+
+# 6. Leading-edge redundancy
+
+
+#Works on `all_results` in memory. Rewrites each `GSEA_*.csv` with the
+#`leadingEdge` column that v4 dropped, writes one cluster table per test, and
+#compares the top cluster's core genes across compartments.
+#```{r GSEA-leading-edge-addon}
+# ---- apply to everything already computed -----------------------------------
+.subdirs <- c(vapply(ALL_TESTS,    function(t) t$subdir, character(1)),
+              vapply(GLOBAL_TESTS, function(t) t$subdir, character(1)))
+names(.subdirs) <- c(vapply(ALL_TESTS,    function(t) t$label, character(1)),
+                     vapply(GLOBAL_TESTS, function(t) t$label, character(1)))
+
+le_all <- list()
+for (lbl in names(all_results)) {
+  g <- all_results[[lbl]]$gsea
+  if (is.null(g) || !"leadingEdge" %in% names(g)) next
+  ob <- file.path(OUTPUT_DIR,
+                  if (lbl %in% names(.subdirs)) .subdirs[[lbl]] else ".")
+  dir.create(ob, showWarnings = FALSE, recursive = TRUE)
+
+  # rewrite the CSV, this time KEEPING the leading edge
+  out <- as.data.frame(g)
+  out$leadingEdge <- vapply(g$leadingEdge,
+                            function(v) paste(v, collapse = "|"), character(1))
+  write.csv(out, file.path(ob, paste0("GSEA_", lbl, "_Aged_vs_Young.csv")),
+            row.names = FALSE)
+
+  le_all[[lbl]] <- summarise_leading_edge(g, lbl, ob)
+}
+
+# ---- is the immune signal ONE finding or four? ------------------------------
+comp <- intersect(c("Follicle", "CL", "Stroma", "Vascular"), names(le_all))
+if (length(comp) >= 2) {
+  tops <- lapply(comp, function(l) strsplit(le_all[[l]]$core_genes[1], "\\|")[[1]])
+  names(tops) <- comp
+  J <- outer(seq_along(comp), seq_along(comp), Vectorize(function(i, j) {
+    a <- tops[[i]]; b <- tops[[j]]; u <- length(union(a, b))
+    if (u == 0) NA_real_ else round(length(intersect(a, b)) / u, 3)
+  }))
+  dimnames(J) <- list(comp, comp)
+  message("\nTop-cluster core-gene Jaccard between compartments:")
+  print(J)
+  write.csv(as.data.frame(J),
+            file.path(OUTPUT_DIR, "GSEA_topCluster_coreGene_overlap.csv"))
+  off <- J[upper.tri(J)]
+  message(sprintf("\nmedian off-diagonal overlap: %.2f", median(off, na.rm = TRUE)))
+  if (median(off, na.rm = TRUE) >= 0.5)
+    message("ONE shared signal across compartments, not four findings.") else
+    message("Compartments differ; compartment-specific programmes are supported.")
+}
+#```
+
+# 7. Meta-modules across tests
+
+#```{r GSEA-meta-modules}
+## =============================================================================
+## META-MODULES: match leading-edge clusters across tests, name them by their
+## genes rather than by their MSigDB label, and draw the summary figure.
+##
+## Answers two questions:
+##   1. which programmes recur across compartments and cell types
+##   2. which cluster labels are borrowed, i.e. the genes are a broad canonical
+##      module wearing a specific-sounding name
+##
+## Requires in the session: le_all (from the leading-edge chunk), gene_sets,
+## gene_set_source, OUTPUT_DIR, tidy_pathway, save_plot.
+## =============================================================================
+
+META_JACCARD      <- 0.40   # core-gene overlap to call two clusters the same module
+META_MIN_CORE     <- 5      # ignore clusters with fewer core genes
+HALLMARK_COVERAGE <- 0.50   # above this, the label is a broad canonical module
+
+## ---- 1. flatten every cluster from every test into one table ---------------
+le_tbl <- do.call(rbind, lapply(names(le_all), function(lbl) {
+  x <- le_all[[lbl]]
+  if (is.null(x) || nrow(x) == 0) return(NULL)
+  x$test <- lbl
+  x
+}))
+le_tbl$core_list <- strsplit(le_tbl$core_genes, "\\|")
+le_tbl <- le_tbl[vapply(le_tbl$core_list, length, integer(1)) >= META_MIN_CORE, ]
+message("clusters carried forward: ", nrow(le_tbl), " from ",
+        length(unique(le_tbl$test)), " tests")
+
+## ---- 2. name each cluster by its genes, using Hallmark as the reference ----
+## Hallmark is 50 curated, deliberately non-redundant sets. If a cluster's core
+## genes sit largely inside one of them, that Hallmark set is the honest label
+## whatever the GO or Reactome name says.
+hallmark <- gene_sets[names(gene_sets) %in%
+                        names(gene_set_source)[gene_set_source == "Hallmark"]]
+
+best_hallmark <- t(vapply(le_tbl$core_list, function(g) {
+  cov <- vapply(hallmark, function(h) length(intersect(g, h)) / length(g), numeric(1))
+  i <- which.max(cov)
+  c(name = names(hallmark)[i], coverage = unname(cov[i]))
+}, character(2)))
+le_tbl$hallmark_match    <- best_hallmark[, "name"]
+le_tbl$hallmark_coverage <- as.numeric(best_hallmark[, "coverage"])
+
+## A cluster is flagged when a broad canonical programme explains most of its
+## genes but the pathway name does not say so. Those are the borrowed labels.
+.kw <- function(s) tolower(gsub("_", " ", sub("^HALLMARK_", "", s)))
+le_tbl$label_supported <- mapply(function(rep_name, hm) {
+  words <- setdiff(strsplit(.kw(hm), " ")[[1]], c("of","the","and","response","v1","v2"))
+  any(vapply(words, function(w) grepl(w, tolower(rep_name), fixed = TRUE), logical(1)))
+}, le_tbl$representative, le_tbl$hallmark_match)
+le_tbl$borrowed_label <- le_tbl$hallmark_coverage >= HALLMARK_COVERAGE &
+                         !le_tbl$label_supported
+
+message("clusters whose genes are >= ", HALLMARK_COVERAGE * 100,
+        "% explained by one Hallmark set: ",
+        sum(le_tbl$hallmark_coverage >= HALLMARK_COVERAGE))
+message("  of which the pathway name does NOT reflect it (borrowed label): ",
+        sum(le_tbl$borrowed_label))
+
+## ---- 3. group clusters into meta-modules by core-gene overlap -------------
+ord <- order(le_tbl$rep_padj)
+le_tbl <- le_tbl[ord, ]
+n <- nrow(le_tbl); mm <- rep(NA_integer_, n); k <- 0L
+for (i in seq_len(n)) {
+  if (!is.na(mm[i])) next
+  k <- k + 1L; mm[i] <- k
+  if (i < n) for (j in (i + 1):n) {
+    if (!is.na(mm[j])) next
+    a <- le_tbl$core_list[[i]]; b <- le_tbl$core_list[[j]]
+    u <- length(union(a, b))
+    if (u > 0 && length(intersect(a, b)) / u >= META_JACCARD) mm[j] <- k
+  }
+}
+le_tbl$meta_module <- mm
+message("meta-modules: ", k, " across ", nrow(le_tbl), " clusters")
+
+## ---- 4. one row per meta-module ------------------------------------------
+meta <- do.call(rbind, lapply(seq_len(k), function(m) {
+  idx <- which(le_tbl$meta_module == m)
+  g   <- table(unlist(le_tbl$core_list[idx]))
+  core <- names(g)[g >= max(1, ceiling(length(idx) / 2))]
+  hm  <- names(sort(table(le_tbl$hallmark_match[idx]), decreasing = TRUE))[1]
+  data.frame(
+    meta_module      = m,
+    n_tests          = length(unique(le_tbl$test[idx])),
+    tests            = paste(sort(unique(le_tbl$test[idx])), collapse = "|"),
+    n_clusters       = length(idx),
+    n_pathways_total = sum(le_tbl$n_pathways[idx]),
+    representative   = le_tbl$representative[idx[1]],
+    hallmark_match   = hm,
+    mean_hallmark_cov = round(mean(le_tbl$hallmark_coverage[idx]), 3),
+    any_borrowed     = any(le_tbl$borrowed_label[idx]),
+    direction        = if (mean(le_tbl$rep_NES[idx]) > 0) "Up in Aged" else "Up in Young",
+    mean_NES         = round(mean(le_tbl$rep_NES[idx]), 3),
+    n_core_genes     = length(core),
+    core_genes       = paste(head(core, 60), collapse = "|"),
+    stringsAsFactors = FALSE)
+}))
+meta <- meta[order(-meta$n_tests, -meta$n_pathways_total), ]
+
+write.csv(le_tbl[, setdiff(names(le_tbl), "core_list")],
+          file.path(OUTPUT_DIR, "GSEA_clusters_annotated_all_tests.csv"),
+          row.names = FALSE)
+write.csv(meta, file.path(OUTPUT_DIR, "GSEA_meta_modules.csv"), row.names = FALSE)
+
+message("\nmeta-modules present in >= 3 tests:")
+top <- meta[meta$n_tests >= 3, ]
+for (i in seq_len(min(nrow(top), 12)))
+  message(sprintf("  %2d tests | %4d pathways | %-34s | %s | cov %.2f%s",
+                  top$n_tests[i], top$n_pathways_total[i],
+                  substr(tidy_pathway(top$representative[i], 34), 1, 34),
+                  top$direction[i], top$mean_hallmark_cov[i],
+                  ifelse(top$any_borrowed[i], "  [label borrowed]", "")))
+
+## ---- 5. the figure: meta-module x test ------------------------------------
+MM_MIN_TESTS <- 3
+MM_MAX_ROWS  <- 25
+
+sel <- meta$meta_module[meta$n_tests >= MM_MIN_TESTS][seq_len(
+  min(MM_MAX_ROWS, sum(meta$n_tests >= MM_MIN_TESTS)))]
+
+plot_df <- le_tbl[le_tbl$meta_module %in% sel, ]
+lab <- setNames(
+  ifelse(meta$any_borrowed[match(sel, meta$meta_module)],
+         paste0(tidy_pathway(meta$hallmark_match[match(sel, meta$meta_module)], 40),
+                " *"),
+         tidy_pathway(meta$representative[match(sel, meta$meta_module)], 40)),
+  sel)
+plot_df$module_label <- lab[as.character(plot_df$meta_module)]
+plot_df$module_label <- factor(
+  plot_df$module_label,
+  levels = rev(unique(lab[as.character(sel)])))
+
+test_order <- c("Global_AllCompartments", "Follicle", "CL", "Stroma", "Vascular",
+                setdiff(unique(plot_df$test),
+                        c("Global_AllCompartments","Follicle","CL","Stroma","Vascular")))
+plot_df$test <- factor(plot_df$test, levels = intersect(test_order, unique(plot_df$test)))
+
+p <- ggplot(plot_df, aes(x = test, y = module_label)) +
+  geom_point(aes(size = n_pathways, fill = rep_NES),
+             shape = 21, colour = "grey25", stroke = 0.25) +
+  scale_fill_gradient2(low = "#007A7A", mid = "white", high = "#B57BEE",
+                       midpoint = 0, name = "NES") +
+  scale_size_continuous(range = c(1.5, 7), name = "pathway names\ncollapsed") +
+  labs(x = NULL, y = NULL,
+       caption = "* label taken from the best-matching Hallmark set; the pathway name did not reflect its genes") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 7),
+        plot.caption = element_text(size = 5.5, colour = "grey35", hjust = 0),
+        panel.grid.major = element_line(colour = "grey94", linewidth = 0.2),
+        legend.key.size = grid::unit(0.35, "cm"),
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6.5))
+
+save_plot(p, file.path(OUTPUT_DIR, "GSEA_meta_modules_across_tests"),
+          width = 7.5, height = max(3.5, 0.26 * length(sel) + 2))
+message("\nwrote GSEA_meta_modules_across_tests")
+
+#```
+
+# 8. Over-representation analysis on the DEG list
+
+
+#GSEA above uses the full ranked gene list and therefore ignores
+#`LFC_THRESHOLD` entirely. If you want an enrichment test that *does* respect
+#your cut, that is over-representation analysis (ORA): take the genes passing
+#padj < `PADJ_CUTOFF` and |LFC| > `LFC_THRESHOLD`, and ask whether each gene set
+#contains more of them than chance, against a universe of the genes actually
+#tested. It answers a different question from GSEA and the two often disagree,
+#which is informative rather than a problem.
+
+#Up and down are run separately, because pooling them lets a set enriched for
+#both directions look significant with no coherent direction.
+
+#Uses `fgsea::fora()`. Verify the signature with `?fora` on your installed
+#version before trusting the output; the chunk stops if the function is absent.
+
+#```{r ORA-from-DEG, eval=FALSE}
+assert_config_current()
+if (!"fora" %in% getNamespaceExports("fgsea"))
+  stop("fgsea::fora() not available in fgsea ", packageVersion("fgsea"),
+       ". Update fgsea, or use clusterProfiler::enricher instead.")
+if (!exists("gene_sets"))
+  stop("Run the {r DEG-GSEA-data} chunk first, gene_sets is needed.")
+
+ora_dir <- file.path(OUTPUT_DIR, "4_ORA")
+dir.create(ora_dir, showWarnings = FALSE, recursive = TRUE)
+
+deg_files <- list.files(OUTPUT_DIR, pattern = "^DEG_.*_Aged_vs_Young\\.csv$",
+                        recursive = TRUE, full.names = TRUE)
+
+ora_all <- bind_rows(lapply(deg_files, function(f) {
+  d   <- read.csv(f, stringsAsFactors = FALSE)
+  lbl <- sub("^DEG_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+  if (!"log2FoldChange_mle" %in% names(d) || "padj_lfcthr" %in% names(d)) {
+    message("[STALE, SKIPPED] ", basename(f)); return(NULL)
+  }
+  d$lfc_call <- d[[DEG_LFC_COL]]
+
+  # The universe is the genes that entered the test, NOT all annotated genes.
+  # Using the whole genome as the universe inflates significance.
+  universe <- d$gene[!is.na(d$padj)]
+  sig <- d %>% filter(!is.na(padj), padj < PADJ_CUTOFF,
+                      abs(lfc_call) >= LFC_THRESHOLD)
+
+  bind_rows(lapply(c("Up_Aged", "Up_Young"), function(dir_lbl) {
+    genes <- if (dir_lbl == "Up_Aged")
+      sig$gene[sig$lfc_call > 0] else sig$gene[sig$lfc_call < 0]
+    message(lbl, " / ", dir_lbl, ": ", length(genes), " genes of ",
+            length(universe), " tested")
+    if (length(genes) < 5) {
+      message("  too few genes, skipped")
+      return(NULL)
+    }
+    res <- fgsea::fora(pathways = gene_sets, genes = genes,
+                       universe = universe, minSize = 10, maxSize = 500)
+    as.data.frame(res) %>%
+      mutate(test = lbl, direction = dir_lbl,
+             n_query = length(genes), n_universe = length(universe),
+             gene_ratio = overlap / size,
+             collection = unname(gene_set_source[pathway]))
+  }))
+}))
+
+ora_out <- ora_all
+ora_out$overlapGenes <- vapply(ora_all$overlapGenes,
+                               function(v) paste(v, collapse = "|"), character(1))
+write.csv(ora_out, file.path(ora_dir, "ORA_all_tests.csv"), row.names = FALSE)
+message("ORA rows written: ", nrow(ora_all),
+        "  significant at padj < 0.05: ",
+        sum(ora_all$padj < 0.05, na.rm = TRUE))
+
+# one dot plot per test, both directions on the same panel
+for (lbl in unique(ora_all$test)) {
+  sig <- ora_all %>% filter(test == lbl, !is.na(padj), padj < 0.05)
+  if (nrow(sig) == 0) {
+    message(lbl, ": no ORA hits at padj < 0.05"); next
+  }
+
+  shim <- sig
+  shim$leadingEdge <- sig$overlapGenes
+  shim$NES <- ifelse(sig$direction == "Up_Aged", sig$gene_ratio, -sig$gene_ratio)
+  cl <- summarise_leading_edge(shim, paste0("ORA_", lbl), ora_dir)
+  if (is.null(cl)) { message(lbl, ": no clusters"); next }
+
+  keep <- cl %>% group_by(direction) %>%
+    slice_max(n_pathways, n = 10, with_ties = FALSE) %>%
+    ungroup() %>% pull(representative)
+  df <- sig %>% filter(pathway %in% keep)
+  if (nrow(df) == 0) { message(lbl, ": nothing to plot"); next }
+
+  df <- df %>%
+    mutate(pathway_label  = tidy_pathway(pathway),
+           neg_log10_padj = -log10(padj)) %>%
+    arrange(direction, gene_ratio)
+  df$pathway_label <- make.unique(df$pathway_label, sep = " ")
+  df$pathway_label <- factor(df$pathway_label, levels = df$pathway_label)
+
+  p <- ggplot(df, aes(x = gene_ratio, y = pathway_label)) +
+    geom_segment(aes(x = 0, xend = gene_ratio,
+                     y = pathway_label, yend = pathway_label),
+                 colour = "grey85", linewidth = 0.25) +
+    geom_point(aes(size = overlap, colour = neg_log10_padj)) +
+    facet_grid(direction ~ ., scales = "free_y", space = "free_y") +
+    scale_colour_viridis_c(option = "C", direction = -1, end = 0.9,
+                           name = expression(-log[10]~italic(p)[adj])) +
+    scale_size_continuous(range = c(1.5, 6), name = "DEGs in set") +
+    scale_x_continuous(limits = c(0, NA), expand = expansion(mult = c(0, .06))) +
+    labs(title = paste0(lbl, ": ORA on DEGs (padj < ", PADJ_CUTOFF,
+                        ", |LFC| > ", LFC_THRESHOLD, ")"),
+         x = "Gene ratio (DEGs in set / set size)", y = NULL) +
+    theme_classic(base_size = 10) +
+    theme(plot.title  = element_text(hjust = 0.5, face = "bold", size = 9),
+          axis.text.y = element_text(size = 7),
+          strip.text  = element_text(size = 8, face = "bold"),
+          legend.key.size = grid::unit(0.35, "cm"))
+
+  save_plot(p, file.path(ora_dir, paste0("ORA_dotplot_", lbl)),
+            width  = GSEA_DOT_W,
+            height = max(3.4, 0.24 * nrow(df) + 2.0))
+}
+message("ORA written to: ", ora_dir)
+#```
+
+# 9. Curation step 1: build the QC template
+
+#Reads every per-test GSEA / ORA result, stamps the leading-edge cluster
+#assignment onto each pathway row, and writes one editable template per test as
+#`<original>_toplot.csv`. Nothing is filtered away: every significant pathway is
+#present, with a pre-filled `plot` column you overwrite by hand.
+
+#Three hard filters are applied before writing, in this order: `padj <
+#CURATE_PADJ`, `size <= CURATE_MAX_SIZE`, and `independent == TRUE`. Rows failing
+#any of them never reach the template. None of this changes a p-value: the tested
+#family is fixed, these are presentation decisions applied downstream.
+
+#`is_rep` is then **recomputed** over the survivors, because
+#`summarise_leading_edge()` chose each cluster's representative before the size
+#filter existed and that representative may have just been dropped. The pre-fill
+#is a suggestion, not a decision: `plot` starts as "plot" on one row per
+#surviving cluster (the lowest-padj member) and "no" everywhere else.
+
+#Existing `_toplot.csv` files are never overwritten unless
+#`CURATE_OVERWRITE <- TRUE`, so re-running this chunk cannot destroy manual work.
+
+#```{r curation-template, eval=FALSE}
+assert_config_current()
+
+CURATE_DIR      <- file.path(OUTPUT_DIR, "5_Curation")
+CURATE_OVERWRITE <- TRUE   # TRUE wipes your manual edits; leave FALSE
+
+# Only rows at or below this adjusted p-value enter the curation template.
+# Kept separate from PADJ_CUTOFF (which is the DEG gene-level cut) so the two
+# can be reported independently in the methods.
+CURATE_PADJ <- 0.05
+
+# Hard drops applied BEFORE the template is written. These are curation
+# decisions, not analysis decisions: the tested family is unchanged, so no padj
+# moves. Report both numbers in the methods.
+CURATE_MAX_SIZE    <- 200    # drop gene sets larger than this
+CURATE_INDEP_ONLY  <- TRUE   # drop sets collapsePathways flagged as redundant
+
+dir.create(CURATE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---- stamp le_cluster / is_rep from the cluster summary onto pathway rows ----
+stamp_clusters <- function(df, cluster_csv) {
+  df$le_cluster      <- NA_integer_
+  df$cluster_size    <- NA_integer_
+  df$is_rep          <- NA
+  df$cluster_members <- NA_character_
+  if (is.null(cluster_csv) || !file.exists(cluster_csv)) {
+    message("  [WARN] cluster file absent: ", basename(as.character(cluster_csv)),
+            " - le_cluster left NA")
+    return(df)
+  }
+  cl <- read.csv(cluster_csv, stringsAsFactors = FALSE)
+  for (i in seq_len(nrow(cl))) {
+    mem <- strsplit(cl$member_pathways[i], "|", fixed = TRUE)[[1]]
+    j   <- which(df$pathway %in% mem)
+    if (!length(j)) next
+    df$le_cluster[j]      <- cl$le_cluster[i]
+    df$cluster_size[j]    <- cl$n_pathways[i]
+    df$is_rep[j]          <- df$pathway[j] == cl$representative[i]
+    df$cluster_members[j] <- cl$member_pathways[i]
+  }
+  df
+}
+
+# ---- hard curation filters ---------------------------------------------------
+# NOTE ON ORDER: summarise_leading_edge() picked each cluster's representative
+# from ALL significant pathways, before these filters existed. A representative
+# can therefore be dropped here, leaving its cluster with no is_rep row. So
+# is_rep is RECOMPUTED below over the surviving rows only.
+apply_curation_filters <- function(df) {
+  n0 <- nrow(df)
+
+  if ("size" %in% names(df)) {
+    n1 <- nrow(df)
+    df <- df[!is.na(df$size) & df$size <= CURATE_MAX_SIZE, , drop = FALSE]
+    message("    size > ", CURATE_MAX_SIZE, ": dropped ", n1 - nrow(df))
+  } else {
+    message("    [WARN] no 'size' column; size filter not applied")
+  }
+
+  if (CURATE_INDEP_ONLY && "independent" %in% names(df)) {
+    if (all(is.na(df$independent))) {
+      message("    [WARN] 'independent' is all NA (collapsePathways did not ",
+              "run); redundancy filter NOT applied")
+    } else {
+      n1 <- nrow(df)
+      df <- df[df$independent %in% TRUE, , drop = FALSE]
+      message("    independent != TRUE: dropped ", n1 - nrow(df))
+    }
+  }
+  if (!nrow(df)) { message("    nothing survived the filters"); return(df) }
+
+  # re-designate the lowest-padj SURVIVING member of each cluster. Direction is
+  # part of the key because an ORA term can be significant in both directions
+  # while carrying a single le_cluster.
+  key <- if ("direction" %in% names(df))
+    paste(df$le_cluster, df$direction) else as.character(df$le_cluster)
+  key[is.na(df$le_cluster)] <- paste0("_unclustered_", which(is.na(df$le_cluster)))
+
+  df$n_kept_in_cluster <- NA_integer_
+  df$is_rep <- FALSE
+  for (k in unique(key)) {
+    j <- which(key == k)
+    df$n_kept_in_cluster[j] <- length(j)
+    df$is_rep[j[which.min(df$padj[j])]] <- TRUE
+  }
+  message("    kept ", nrow(df), " of ", n0, " rows in ",
+          length(unique(key)), " leading-edge clusters")
+  df
+}
+
+# ---- column order that makes hand-editing in Excel bearable ------------------
+front_cols <- function(df) {
+  first <- c("plot", "display_label", "notes", "pathway", "le_cluster",
+             "cluster_size", "n_kept_in_cluster", "is_rep", "independent",
+             "size", "NES", "foldEnrichment", "gene_ratio", "overlap",
+             "padj", "pval", "direction", "collection", "test")
+  first <- first[first %in% names(df)]
+  rest  <- setdiff(names(df), c(first, "leadingEdge", "overlapGenes",
+                                "cluster_members"))
+  tail  <- intersect(c("cluster_members", "leadingEdge", "overlapGenes"),
+                     names(df))
+  df[, c(first, rest, tail), drop = FALSE]
+}
+
+write_template <- function(df, out_name) {
+  out <- file.path(CURATE_DIR, out_name)
+  if (file.exists(out) && !CURATE_OVERWRITE) {
+    message("  [KEPT] ", out_name, " already exists, not overwritten")
+    return(invisible(NULL))
+  }
+  # foldEnrichment = (overlap/n_query)/(size/n_universe), i.e. observed over
+  # expected, and it supersedes our home-made gene_ratio = overlap/size. Keeping
+  # both invites reporting the wrong one, so gene_ratio is dropped when
+  # foldEnrichment is available.
+  if (all(c("foldEnrichment", "gene_ratio") %in% names(df))) {
+    df$gene_ratio <- NULL
+    message("    gene_ratio dropped; foldEnrichment is the effect size")
+  }
+  df$display_label <- tidy_pathway(df$pathway)
+  df$notes         <- ""
+  # size and independence are already enforced by apply_curation_filters(), so
+  # the only remaining pre-fill rule is one row per surviving cluster.
+  df$plot <- ifelse(!is.na(df$is_rep) & df$is_rep, "plot", "no")
+  ord <- order(is.na(df$le_cluster), df$le_cluster, df$padj)
+  df  <- front_cols(df[ord, , drop = FALSE])
+  write.csv(df, out, row.names = FALSE)
+  message("  [WRITTEN] ", out_name, ": ", nrow(df), " rows, ",
+          sum(df$plot == "plot"), " pre-marked 'plot'")
+}
+
+# ---- GSEA --------------------------------------------------------------------
+gsea_files <- list.files(OUTPUT_DIR, pattern = "^GSEA_.*_Aged_vs_Young\\.csv$",
+                         recursive = TRUE, full.names = TRUE)
+message("GSEA result files found: ", length(gsea_files))
+for (f in gsea_files) {
+  lbl <- sub("^GSEA_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+  d0  <- read.csv(f, stringsAsFactors = FALSE)
+  d   <- d0[!is.na(d0$padj) & d0$padj < CURATE_PADJ, , drop = FALSE]
+  message(lbl, ": ", nrow(d), " of ", nrow(d0),
+          " tested sets kept at padj < ", CURATE_PADJ,
+          " (", nrow(d0) - nrow(d), " dropped)")
+  if (!nrow(d)) next
+  d <- stamp_clusters(d, file.path(dirname(f),
+                                   paste0("GSEA_leadingEdge_clusters_", lbl, ".csv")))
+  d <- apply_curation_filters(d)
+  if (!nrow(d)) next
+  write_template(d, sub("\\.csv$", "_toplot.csv", basename(f)))
+}
+
+# ---- ORA ---------------------------------------------------------------------
+ora_file <- file.path(OUTPUT_DIR, "4_ORA", "ORA_all_tests.csv")
+if (file.exists(ora_file)) {
+  ora <- read.csv(ora_file, stringsAsFactors = FALSE)
+  for (lbl in unique(ora$test)) {
+    d0 <- ora[ora$test == lbl, , drop = FALSE]
+    d  <- d0[!is.na(d0$padj) & d0$padj < CURATE_PADJ, , drop = FALSE]
+    message("ORA ", lbl, ": ", nrow(d), " of ", nrow(d0),
+            " terms kept at padj < ", CURATE_PADJ,
+            " (", nrow(d0) - nrow(d), " dropped)")
+    if (!nrow(d)) next
+    d <- stamp_clusters(d, file.path(OUTPUT_DIR, "4_ORA",
+                                     paste0("GSEA_leadingEdge_clusters_ORA_",
+                                            lbl, ".csv")))
+    # a term can be significant in BOTH directions; the cluster file carries no
+    # direction, so both rows inherit the same le_cluster. apply_curation_filters
+    # keys on cluster + direction so the two are not collapsed into one.
+    # ORA has no 'independent' column, so only the size filter applies here.
+    d <- apply_curation_filters(d)
+    if (!nrow(d)) next
+    write_template(d, paste0("ORA_", lbl, "_toplot.csv"))
+  }
+} else {
+  message("ORA_all_tests.csv not found; ORA templates skipped")
+}
+message("Templates written to: ", CURATE_DIR)
+```
+
+# 10. Curation step 2: manuscript dot plots from the curated list
+
+
+Plots only the rows you marked. Finds every `*_toplot.csv` anywhere under
+`OUTPUT_DIR`, so it does not matter which folder you edit them in.
+
+Required columns: `pathway`, `plot`. Optional: `display_label` (the name printed
+on the axis; falls back to the tidied pathway name if blank), `panel` (adds a
+facet). Accepted "yes" values in `plot`, case-insensitive: plot, yes, y, true, 1.
+Anything else is treated as "no" and reported.
+
+The file type is detected from its columns: `NES` present means GSEA (x = NES,
+reference line at 0), otherwise `foldEnrichment` means ORA (x = fold enrichment,
+reference line at 1, faceted by direction). `gene_ratio` is used only as a
+fallback for older ORA files that lack `foldEnrichment`.
+
+```{r manuscript-dotplots, eval=FALSE}
+assert_config_current()
+
+MANU_DIR <- file.path(OUTPUT_DIR, "6_Manuscript")
+dir.create(MANU_DIR, showWarnings = FALSE, recursive = TRUE)
+MANU_DOT_W <- 7.5
+MANU_DOT_TOP_PER_DIR <- 15
+MANU_DOT_H_MAX       <- 12
+
+is_marked <- function(x)
+  tolower(trimws(as.character(x))) %in% c("plot", "yes", "y", "true", "1")
+
+curated <- list.files(OUTPUT_DIR, pattern = "_toplot\\.csv$",
+                      recursive = TRUE, full.names = TRUE)
+if (!length(curated))
+  stop("No *_toplot.csv found under ", OUTPUT_DIR,
+       ". Run the {r curation-template} chunk first.")
+message("Curated files found: ", length(curated))
+
+for (f in curated) {
+  lbl <- sub("_toplot$", "", tools::file_path_sans_ext(basename(f)))
+  d   <- read.csv(f, stringsAsFactors = FALSE)
+
+  miss <- setdiff(c("pathway", "plot"), names(d))
+  if (length(miss)) {
+    message("[SKIP] ", basename(f), ": missing column(s) ",
+            paste(miss, collapse = ", ")); next
+  }
+  vals <- unique(tolower(trimws(as.character(d$plot))))
+  bad  <- setdiff(vals, c("plot","yes","y","true","1","no","n","false","0",""))
+  if (length(bad))
+    message("[WARN] ", basename(f), ": unrecognised plot values treated as ",
+            "'no': ", paste(bad, collapse = ", "))
+
+  d <- d[is_marked(d$plot), , drop = FALSE]
+  if (!nrow(d)) { message("[SKIP] ", basename(f), ": nothing marked"); next }
+
+  mode <- NA_character_
+  if ("NES" %in% names(d)) mode <- "GSEA"
+  else if (any(c("foldEnrichment", "gene_ratio") %in% names(d))) mode <- "ORA"
+  if (is.na(mode)) {
+    message("[SKIP] ", basename(f),
+            ": none of NES / foldEnrichment / gene_ratio present"); next
+  }
+
+  # axis labels: display_label if supplied and non-blank, else tidied pathway
+  lab <- tidy_pathway(d$pathway)
+  if ("display_label" %in% names(d)) {
+    dl  <- trimws(as.character(d$display_label))
+    lab <- ifelse(!is.na(dl) & nzchar(dl), dl, lab)
+  }
+  d$pathway_label <- lab
+
+  # padj == 0 underflows to Inf on the -log10 scale; draw at the panel maximum
+  d$neg_log10_padj <- -log10(d$padj)
+  fin <- is.finite(d$neg_log10_padj)
+  if (any(!fin)) {
+    ceil <- if (any(fin)) max(d$neg_log10_padj[fin]) else 300
+    message("  ", sum(!fin), " pathway(s) with padj = 0 drawn at ",
+            round(ceil, 1), " on the colour scale")
+    d$neg_log10_padj[!fin] <- ceil
+  }
+
+  if (mode == "GSEA") {
+    ok   <- which(!is.na(d$NES))
+    pos  <- ok[d$NES[ok] >  0]
+    neg  <- ok[d$NES[ok] <= 0]
+    pos  <- pos[order(-d$NES[pos])]
+    neg  <- neg[order( d$NES[neg])]
+    keep <- sort(c(head(pos, MANU_DOT_TOP_PER_DIR),
+                   head(neg, MANU_DOT_TOP_PER_DIR)))
+  } else {
+    eff  <- if ("foldEnrichment" %in% names(d)) d$foldEnrichment else d$gene_ratio
+    keep <- sort(order(-eff, d$padj)[seq_len(min(nrow(d),
+                                                 2 * MANU_DOT_TOP_PER_DIR))])
+  }
+  if (length(keep) < nrow(d))
+    message("[CAPPED] ", basename(f), ": ", nrow(d),
+            " rows marked 'plot'; plotting ", length(keep),
+            if (mode == "GSEA") " (top/bottom NES)" else
+              " (top by effect size)")
+  d <- d[keep, , drop = FALSE]
+
+  if (mode == "GSEA") {
+    d <- d[order(d$NES), , drop = FALSE]
+    d$pathway_label <- make.unique(d$pathway_label, sep = " ")
+    d$pathway_label <- factor(d$pathway_label, levels = d$pathway_label)
+    x_abs <- max(abs(d$NES), na.rm = TRUE)
+
+    p <- ggplot(d, aes(x = NES, y = pathway_label)) +
+      geom_vline(xintercept = 0, linetype = "dashed",
+                 colour = "grey55", linewidth = 0.25) +
+      geom_segment(aes(x = 0, xend = NES,
+                       y = pathway_label, yend = pathway_label),
+                   colour = "grey85", linewidth = 0.25) +
+      geom_point(aes(size = size, fill = neg_log10_padj),
+                 shape = 21, colour = "black", stroke = 0.25) +
+      scale_size_continuous(range = c(1.5, 6), name = "Genes in set") +
+      scale_x_continuous(limits = c(-x_abs, x_abs) * 1.08,
+                         expand = expansion(mult = 0)) +
+      labs(x = "Normalised Enrichment Score (NES)", y = NULL)
+  } else {
+    if (!"direction" %in% names(d)) d$direction <- "All"
+
+    # foldEnrichment is observed/expected, so its null value is 1, not 0. The
+    # lollipop baseline and the reference line both sit at 1. gene_ratio is a
+    # fraction with a null at 0, so the baseline moves accordingly.
+    if ("foldEnrichment" %in% names(d)) {
+      x_var <- "foldEnrichment"; x_null <- 1
+      x_lab <- "Fold enrichment (observed / expected)"
+    } else {
+      x_var <- "gene_ratio"; x_null <- 0
+      x_lab <- "Gene ratio (DEGs in set / set size)"
+    }
+    d <- d[order(d$direction, d[[x_var]]), , drop = FALSE]
+    d$pathway_label <- make.unique(d$pathway_label, sep = " ")
+    d$pathway_label <- factor(d$pathway_label, levels = d$pathway_label)
+    size_var <- if ("overlap" %in% names(d)) "overlap" else "size"
+    x_lo <- min(x_null, min(d[[x_var]], na.rm = TRUE))
+
+    p <- ggplot(d, aes(x = .data[[x_var]], y = pathway_label)) +
+      geom_vline(xintercept = x_null, linetype = "dashed",
+                 colour = "grey55", linewidth = 0.25) +
+      geom_segment(aes(x = x_null, xend = .data[[x_var]],
+                       y = pathway_label, yend = pathway_label),
+                   colour = "grey85", linewidth = 0.25) +
+      geom_point(aes(size = .data[[size_var]], fill = neg_log10_padj),
+                 shape = 21, colour = "black", stroke = 0.25) +
+      facet_grid(direction ~ ., scales = "free_y", space = "free_y") +
+      scale_size_continuous(range = c(2, 7.5), name = "DEGs in set") +
+      scale_x_continuous(limits = c(x_lo, NA),
+                         expand = expansion(mult = c(0, .06))) +
+      labs(x = x_lab, y = NULL)
+  }
+
+  if ("panel" %in% names(d) && length(unique(d$panel)) > 1)
+    p <- p + facet_grid(panel ~ ., scales = "free_y", space = "free_y")
+
+  p <- p +
+    scale_fill_viridis_c(option = "C", direction = 1, begin = 0.05, end = 1,
+                         name = expression(-log[10]~italic(p)[adj])) +
+    guides(size = guide_legend(override.aes = list(shape = 21,
+                                                   fill = "grey70",
+                                                   colour = "black"))) +
+    theme_classic(base_size = 10) +
+    theme(axis.text.y = element_text(size = 7),
+          axis.text.x = element_text(size = 8),
+          strip.text  = element_text(size = 8, face = "bold"),
+          legend.title = element_text(size = 8),
+          legend.text  = element_text(size = 7),
+          legend.key.size = grid::unit(0.35, "cm"),
+          panel.grid.major.y = element_line(colour = "grey93",
+                                            linewidth = 0.2))
+
+  save_plot(p, file.path(MANU_DIR, paste0("Curated_dotplot_", lbl)),
+            width  = MANU_DOT_W,
+            height = min(MANU_DOT_H_MAX, max(3.2, 0.24 * nrow(d) + 1.7)))
+
+  # the exact rows behind the figure, for the figure legend and the record
+  write.csv(d[, setdiff(names(d), c("leadingEdge", "overlapGenes",
+                                    "cluster_members")), drop = FALSE],
+            file.path(MANU_DIR, paste0("Curated_dotplot_", lbl, "_source.csv")),
+            row.names = FALSE)
+  message("[PLOTTED] ", lbl, ": ", nrow(d), " pathways (", mode, ")")
+}
+message("Manuscript dot plots written to: ", MANU_DIR)
+#```
+
+# 11. Matrisome by category, and the ligand-receptor scatter
+
+## Matrisome regulation by category
+
+#x is the percentage of **detected** genes in each category that are DEGs, so the
+#six categories are comparable despite ranging from 36 to 367 annotated members.
+#Detection coverage sits in the y-axis label as `Collagens (38/44)`, meaning
+#detected out of annotated. Bars are dodged, both directions on the right, with
+#`n (x%)` at each bar end.
+
+#"Detected" means present in the DEG table with a non-`NA` `padj`. Genes dropped
+#by the pseudobulk count filter, or given `padj = NA` by DESeq2's independent
+#filtering, were never tested and are excluded from the denominator.
+
+#Both panels resized for a narrow, stacked layout. Paste at the end of the Rmd and
+#run Panel A first.
+
+#*Sizing.** 1 inch = 25.4 mm. The defaults below are `3.0 x 1.7 in` (76 x 43 mm)
+#for Panel A and `3.0 x 2.0 in` (76 x 51 mm) for Panel B, so the pair stacks into
+#roughly 76 x 94 mm. Change `MBAR_W/MBAR_H` and `LR_W/LR_H` to match your real
+#slot; everything else scales from them.
+
+---
+
+## Panel A: matrisome regulation by category
+
+#Thinner bars, no gap between the two bars of a category, legend inside the plot
+#area at top right. Move the legend by editing the two numbers in
+#`leg_inside(0.99, 0.99, ...)`; `leg_inside(0.99, 0.02, just = c(1, 0))` puts it
+#bottom right instead.
+
+#```{r matrisome-category-bar, eval=FALSE}
+assert_config_current()
+
+MBAR_TEST <- "Global_AllCompartments"
+MBAR_DIR  <- file.path(OUTPUT_DIR, "6_Manuscript")
+MBAR_REF_DIR <- "Z:/Visium_Data/001_SpatialX"
+MBAR_W <- 3.0        # inches -> 76 mm
+MBAR_H <- 1.7        # inches -> 43 mm
+MBAR_BAR_W <- 0.85   # bar thickness AND dodge width; equal = bars touch
+MBAR_MIN_TESTED <- 15
+
+MBAR_ORDER <- c("Collagens", "ECM Glycoproteins", "Proteoglycans",
+                "ECM Regulators", "ECM-affiliated Proteins", "Secreted Factors")
+
+VOLC_COLS <- c("Up in Aged"  = "#B57BEE",
+               "Up in Young" = "#007A7A",
+               "NS"          = "grey70")
+
+# ggplot2 3.5.0 replaced numeric legend.position with legend.position.inside
+leg_inside <- function(x, y, just = c(x, y)) {
+  if (utils::packageVersion("ggplot2") >= "3.5.0")
+    ggplot2::theme(legend.position = "inside",
+                   legend.position.inside = c(x, y),
+                   legend.justification = just)
+  else
+    ggplot2::theme(legend.position = c(x, y),
+                   legend.justification = just)
+}
+
+dir.create(MBAR_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---- matrisome table: reuse the volcano chunk's object, or load it ----------
+if (!exists("matri")) {
+  mfile <- list.files(MBAR_REF_DIR,
+                      pattern = "^Mm_Matrisome_Masterlist.*\\.csv$",
+                      full.names = TRUE)
+  if (!length(mfile)) stop("Matrisome CSV not found in ", MBAR_REF_DIR)
+  rawm <- read.csv(mfile[1], stringsAsFactors = FALSE, check.names = FALSE)
+  nm   <- gsub("[^a-z]", "", tolower(names(rawm)))
+  need <- c("genesymbol", "matrisomedivision", "matrisomecategory")
+  miss <- need[!need %in% nm]
+  if (length(miss))
+    stop("Matrisome CSV missing column(s) for: ", paste(miss, collapse = ", "),
+         ". Columns present: ", paste(names(rawm), collapse = ", "))
+  matri <- data.frame(
+    gene               = trimws(as.character(rawm[[which(nm == "genesymbol")[1]]])),
+    matrisome_division = as.character(rawm[[which(nm == "matrisomedivision")[1]]]),
+    matrisome_category = as.character(rawm[[which(nm == "matrisomecategory")[1]]]),
+    stringsAsFactors   = FALSE)
+  matri <- matri[nzchar(matri$gene) & !is.na(matri$gene), , drop = FALSE]
+  matri <- matri[!duplicated(matri$gene), , drop = FALSE]
+}
+n_annot <- table(matri$matrisome_category)
+message("Matrisome masterlist: ", nrow(matri), " symbols")
+
+# ---- the DEG table ----------------------------------------------------------
+f <- list.files(OUTPUT_DIR,
+                pattern = paste0("^DEG_", MBAR_TEST, "_Aged_vs_Young\\.csv$"),
+                recursive = TRUE, full.names = TRUE)
+if (!length(f)) stop("No DEG file for ", MBAR_TEST)
+d <- read.csv(f[1], stringsAsFactors = FALSE)
+d$lfc <- d[[DEG_LFC_COL]]
+d <- d[!is.na(d$padj) & !is.na(d$lfc), , drop = FALSE]
+message("Genes tested in ", MBAR_TEST, ": ", nrow(d))
+
+d <- merge(d, matri, by = "gene")
+message("  of which matrisome: ", nrow(d))
+
+d$sig <- dplyr::case_when(
+  d$padj < PADJ_CUTOFF & d$lfc >=  LFC_THRESHOLD ~ "Up in Aged",
+  d$padj < PADJ_CUTOFF & d$lfc <= -LFC_THRESHOLD ~ "Up in Young",
+  TRUE                                           ~ "NS")
+
+# ---- per-category table -----------------------------------------------------
+cats  <- intersect(MBAR_ORDER, unique(d$matrisome_category))
+extra <- setdiff(unique(d$matrisome_category), MBAR_ORDER)
+if (length(extra)) {
+  message("[WARN] category not in MBAR_ORDER, appended: ",
+          paste(extra, collapse = ", "))
+  cats <- c(cats, extra)
+}
+
+tab <- do.call(rbind, lapply(cats, function(cc) {
+  s <- d[d$matrisome_category == cc, , drop = FALSE]
+  data.frame(category    = cc,
+             division    = s$matrisome_division[1],
+             n_annotated = as.integer(n_annot[cc]),
+             n_detected  = nrow(s),
+             n_up_aged   = sum(s$sig == "Up in Aged"),
+             n_up_young  = sum(s$sig == "Up in Young"),
+             stringsAsFactors = FALSE)
+}))
+tab$pct_detected <- 100 * tab$n_detected / tab$n_annotated
+tab$pct_up_aged  <- 100 * tab$n_up_aged  / tab$n_detected
+tab$pct_up_young <- 100 * tab$n_up_young / tab$n_detected
+print(tab, row.names = FALSE)
+
+thin <- tab$category[tab$n_detected < MBAR_MIN_TESTED]
+if (length(thin))
+  message("[WARN] fewer than ", MBAR_MIN_TESTED, " genes detected in: ",
+          paste(thin, collapse = ", "),
+          " - one gene moves the percentage a long way")
+
+write.csv(tab, file.path(MBAR_DIR,
+          paste0("Matrisome_category_counts_", MBAR_TEST, ".csv")),
+          row.names = FALSE)
+
+# ---- long form --------------------------------------------------------------
+tab$cat_lab <- paste0(tab$category, " (", tab$n_detected, "/",
+                      tab$n_annotated, ")")
+plt <- rbind(
+  data.frame(cat_lab = tab$cat_lab, sig = "Up in Young",
+             n = tab$n_up_young, pct = tab$pct_up_young,
+             stringsAsFactors = FALSE),
+  data.frame(cat_lab = tab$cat_lab, sig = "Up in Aged",
+             n = tab$n_up_aged,  pct = tab$pct_up_aged,
+             stringsAsFactors = FALSE))
+plt$cat_lab <- factor(plt$cat_lab, levels = rev(tab$cat_lab))
+plt$sig     <- factor(plt$sig, levels = c("Up in Young", "Up in Aged"))
+plt$lab     <- paste0(plt$n, " (", round(plt$pct), "%)")
+
+x_max <- max(plt$pct, na.rm = TRUE)
+if (x_max == 0) stop("No matrisome DEGs in ", MBAR_TEST, "; nothing to plot.")
+
+# equal col width and dodge width = the two bars of a category touch
+pos <- position_dodge(width = MBAR_BAR_W)
+
+p <- ggplot(plt, aes(x = pct, y = cat_lab, fill = sig)) +
+  geom_col(position = pos, width = MBAR_BAR_W,
+           colour = "black", linewidth = 0.15) +
+  geom_text(aes(label = lab), position = pos,
+            hjust = -0.12, size = 1.9, colour = "grey20") +
+  scale_fill_manual(values = VOLC_COLS, name = NULL) +
+  scale_x_continuous(limits = c(0, x_max * 1.55),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "% of detected genes in category", y = NULL) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme_classic(base_size = 8) +
+  theme(axis.text.y       = element_text(size = 6),
+        axis.text.x       = element_text(size = 6),
+        axis.title.x      = element_text(size = 6.5),
+        axis.ticks        = element_line(linewidth = 0.2),
+        legend.direction  = "vertical",
+        legend.text       = element_text(size = 5.8),
+        legend.key.size   = grid::unit(0.22, "cm"),
+        legend.background = element_rect(fill = scales::alpha("white", 0.75),
+                                         colour = NA),
+        legend.margin     = margin(1, 2, 1, 2),
+        plot.margin       = margin(3, 6, 3, 3)) +
+  leg_inside(0.99, 0.99)
+
+save_plot(p, file.path(MBAR_DIR,
+          paste0("Matrisome_category_bar_", MBAR_TEST)),
+          width = MBAR_W, height = MBAR_H)
+message("Matrisome category bar written to: ", MBAR_DIR)
+#```
+
+## Ligand-receptor coordination scatter, ConnectomeDB2025
+
+#```{r lr-scatter-connectomedb, eval=FALSE}
+#assert_config_current()
+
+LR_TEST    <- "Global_AllCompartments"
+LR_DIR     <- file.path(OUTPUT_DIR, "6_Manuscript")
+LR_REF_DIR <- "Z:/Visium_Data/001_SpatialX"
+LR_REF_PAT <- "^ConnectomeDB.*mouse.*\\.csv$"
+
+LR_W <- 3.0          # inches -> 76 mm
+LR_H <- 2.0          # inches -> 51 mm
+LR_MAX_LABELS <- 10
+LR_PT_BG   <- 0.55   # grey background point size
+LR_PT_FG   <- 0.65   # highlighted point size; set to LR_PT_BG to match exactly
+LR_LABEL_QUADRANT <- "topright"   # "topright", "bottomleft" or "none"
+
+LR_EVIDENCE <- NULL
+LR_MATRISOME_LIGAND_ONLY <- FALSE
+LR_SHOW_DISCORDANT <- TRUE
+
+LR_COLS <- c("Both up in Aged"  = "#B57BEE",
+             "Both up in Young" = "#007A7A",
+             "Discordant"       = "#E08214")
+
+leg_inside <- function(x, y, just = c(x, y)) {
+  if (utils::packageVersion("ggplot2") >= "3.5.0")
+    ggplot2::theme(legend.position = "inside",
+                   legend.position.inside = c(x, y),
+                   legend.justification = just)
+  else
+    ggplot2::theme(legend.position = c(x, y),
+                   legend.justification = just)
+}
+
+dir.create(LR_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---- the database -----------------------------------------------------------
+rf <- list.files(LR_REF_DIR, pattern = LR_REF_PAT, full.names = TRUE)
+if (!length(rf)) stop("No file matching ", LR_REF_PAT, " in ", LR_REF_DIR)
+cdb <- read.csv(rf[1], stringsAsFactors = FALSE, check.names = FALSE)
+message("ConnectomeDB rows: ", nrow(cdb), "  (", basename(rf[1]), ")")
+
+if (!"LR Pair" %in% names(cdb))
+  stop("No 'LR Pair' column. Columns: ", paste(names(cdb), collapse = ", "))
+
+sp <- strsplit(trimws(cdb[["LR Pair"]]), "[[:space:]]+")
+ok <- lengths(sp) == 2
+if (any(!ok))
+  message("  [WARN] ", sum(!ok),
+          " row(s) whose 'LR Pair' is not two symbols, dropped")
+
+pairs <- data.frame(
+  ligand   = vapply(sp[ok], `[`, character(1), 1),
+  receptor = vapply(sp[ok], `[`, character(1), 2),
+  evidence = if ("Evidence" %in% names(cdb)) cdb[["Evidence"]][ok]
+             else NA_character_,
+  stringsAsFactors = FALSE)
+
+if (!is.null(LR_EVIDENCE)) {
+  n0 <- nrow(pairs)
+  pairs <- pairs[pairs$evidence %in% LR_EVIDENCE, , drop = FALSE]
+  message("  evidence filter '", paste(LR_EVIDENCE, collapse = "/"), "': ",
+          nrow(pairs), " of ", n0)
+}
+n0 <- nrow(pairs)
+pairs <- pairs[!duplicated(pairs[, c("ligand", "receptor")]), , drop = FALSE]
+message("  unique pairs: ", nrow(pairs), " (", n0 - nrow(pairs),
+        " duplicates dropped)")
+
+# ---- the DEG table ----------------------------------------------------------
+f <- list.files(OUTPUT_DIR,
+                pattern = paste0("^DEG_", LR_TEST, "_Aged_vs_Young\\.csv$"),
+                recursive = TRUE, full.names = TRUE)
+if (!length(f)) stop("No DEG file for ", LR_TEST)
+d <- read.csv(f[1], stringsAsFactors = FALSE)
+d$lfc <- d[[DEG_LFC_COL]]
+d <- d[!is.na(d$padj) & !is.na(d$lfc), c("gene", "lfc", "padj", "pvalue")]
+message("Genes tested in ", LR_TEST, ": ", nrow(d))
+
+pairs <- merge(pairs, setNames(d, c("ligand", "lfc_lig", "padj_lig", "p_lig")),
+               by = "ligand")
+pairs <- merge(pairs, setNames(d, c("receptor", "lfc_rec", "padj_rec", "p_rec")),
+               by = "receptor")
+message("Pairs with BOTH sides tested: ", nrow(pairs),
+        "  (", length(unique(pairs$ligand)), " ligands, ",
+        length(unique(pairs$receptor)), " receptors)")
+if (!nrow(pairs)) stop("No pair had both sides tested.")
+
+if (exists("matri")) {
+  message("  of these, ligand is a matrisome gene: ",
+          sum(pairs$ligand %in% matri$gene))
+  if (LR_MATRISOME_LIGAND_ONLY) {
+    pairs <- pairs[pairs$ligand %in% matri$gene, , drop = FALSE]
+    message("  restricted to matrisome ligands: ", nrow(pairs), " pairs")
+    if (!nrow(pairs)) stop("No matrisome-ligand pair had both sides tested.")
+  }
+} else if (LR_MATRISOME_LIGAND_ONLY) {
+  stop("LR_MATRISOME_LIGAND_ONLY is TRUE but 'matri' is not in the session. ",
+       "Run the {r matrisome-category-bar} chunk above first.")
+}
+
+# ---- concordance ------------------------------------------------------------
+is_sig <- function(l, p) !is.na(p) & p < PADJ_CUTOFF & abs(l) >= LFC_THRESHOLD
+pairs$sig_lig <- is_sig(pairs$lfc_lig, pairs$padj_lig)
+pairs$sig_rec <- is_sig(pairs$lfc_rec, pairs$padj_rec)
+pairs$both    <- pairs$sig_lig & pairs$sig_rec
+pairs$class <- dplyr::case_when(
+  pairs$both & pairs$lfc_lig > 0 & pairs$lfc_rec > 0 ~ "Both up in Aged",
+  pairs$both & pairs$lfc_lig < 0 & pairs$lfc_rec < 0 ~ "Both up in Young",
+  pairs$both                                         ~ "Discordant",
+  TRUE                                               ~ "Not both significant")
+pairs$pair_label <- paste0(pairs$ligand, "\u2013", pairs$receptor)
+
+message("Ligand significant only  : ", sum(pairs$sig_lig & !pairs$sig_rec))
+message("Receptor significant only: ", sum(pairs$sig_rec & !pairs$sig_lig))
+print(table(pairs$class))
+
+write.csv(pairs[order(-pairs$both, pairs$class, pairs$ligand, pairs$receptor), ],
+          file.path(LR_DIR,
+                    paste0("LR_pairs_ConnectomeDB2025_", LR_TEST, ".csv")),
+          row.names = FALSE)
+
+# ---- the scatter ------------------------------------------------------------
+hi_classes <- c("Both up in Aged", "Both up in Young")
+if (LR_SHOW_DISCORDANT) hi_classes <- c(hi_classes, "Discordant")
+
+bg <- pairs[!pairs$class %in% hi_classes, , drop = FALSE]
+fg <- pairs[ pairs$class %in% hi_classes, , drop = FALSE]
+message("Highlighted: ", nrow(fg), "   background: ", nrow(bg))
+
+lb <- if (nrow(fg)) {
+  o <- order(-(abs(fg$lfc_lig) + abs(fg$lfc_rec)))
+  fg[o[seq_len(min(LR_MAX_LABELS, nrow(fg)))], , drop = FALSE]
+} else fg
+if (nrow(fg) > nrow(lb))
+  message("  labelling the ", nrow(lb), " largest of ", nrow(fg),
+          "; the rest are in the CSV")
+
+ax_abs <- max(abs(c(pairs$lfc_lig, pairs$lfc_rec)), na.rm = TRUE) * 1.08
+
+p <- ggplot(mapping = aes(x = lfc_lig, y = lfc_rec)) +
+  geom_hline(yintercept = 0, colour = "grey45", linewidth = 0.2) +
+  geom_vline(xintercept = 0, colour = "grey45", linewidth = 0.2) +
+  geom_hline(yintercept = c(-LFC_THRESHOLD, LFC_THRESHOLD),
+             linetype = "dashed", colour = "grey78", linewidth = 0.18) +
+  geom_vline(xintercept = c(-LFC_THRESHOLD, LFC_THRESHOLD),
+             linetype = "dashed", colour = "grey78", linewidth = 0.18) +
+  geom_point(data = bg, colour = "grey80", size = LR_PT_BG, alpha = 0.6) +
+  geom_point(data = fg, aes(fill = class), shape = 21, size = LR_PT_FG,
+             stroke = 0.16, colour = "black")
+
+if (nrow(lb)) {
+  rep_args <- list(
+    data = lb, mapping = aes(label = pair_label),
+    size = 1.8, seed = 42, max.overlaps = Inf,
+    box.padding = 0.16, point.padding = 0.10,
+    min.segment.length = 0, segment.size = 0.15,
+    segment.colour = "grey55", segment.alpha = 0.8,
+    force = 3, max.iter = 20000)
+  if (LR_LABEL_QUADRANT == "topright") {
+    rep_args$xlim <- c(0, NA); rep_args$ylim <- c(0, NA)
+    out <- sum(lb$lfc_lig < 0 | lb$lfc_rec < 0)
+  } else if (LR_LABEL_QUADRANT == "bottomleft") {
+    rep_args$xlim <- c(NA, 0); rep_args$ylim <- c(NA, 0)
+    out <- sum(lb$lfc_lig > 0 | lb$lfc_rec > 0)
+  } else out <- 0
+  if (out)
+    message("  [WARN] ", out, " labelled pair(s) lie outside the ",
+            LR_LABEL_QUADRANT, " quadrant, so their labels will be pulled ",
+            "across the panel. Set LR_LABEL_QUADRANT <- \"none\" if that ",
+            "looks wrong.")
+  rep_args$box.padding <- 0.24
+  p <- p + do.call(ggrepel::geom_text_repel, rep_args)
+}
+
+p <- p +
+  scale_fill_manual(values = LR_COLS, name = NULL, drop = TRUE) +
+  scale_x_continuous(limits = c(-ax_abs, ax_abs), expand = expansion(mult = 0)) +
+  scale_y_continuous(limits = c(-ax_abs, ax_abs), expand = expansion(mult = 0)) +
+  labs(x = "L2FC of Ligand", y = "L2FC of Receptor") +
+  guides(fill = guide_legend(override.aes = list(size = 1.6))) +
+  theme_classic(base_size = 8) +
+  theme(axis.text         = element_text(size = 6),
+        axis.title        = element_text(size = 6.5),
+        axis.ticks        = element_line(linewidth = 0.2),
+        legend.direction  = "vertical",
+        legend.text       = element_text(size = 5.5),
+        legend.key.size   = grid::unit(0.2, "cm"),
+        legend.background = element_rect(fill = scales::alpha("white", 0.75),
+                                         colour = NA),
+        legend.margin     = margin(1, 2, 1, 2),
+        plot.margin       = margin(3, 4, 3, 3)) +
+  leg_inside(0.99, 0.02, just = c(1, 0))
+
+save_plot(p, file.path(LR_DIR,
+          paste0("LR_scatter_ConnectomeDB2025_", LR_TEST)),
+          width = LR_W, height = LR_H)
+message("LR scatter written to: ", LR_DIR)
+#```
+
+# 12. Supplementary tables
+
+#Copies the full, uncurated result tables into one folder under the names you
+#want for the supplement. No filtering: these are the complete outputs.
+
+#```{r supplementary-tables, eval=FALSE}
+assert_config_current()
+
+SUPP_DIR <- file.path(OUTPUT_DIR, "7_Supplementary")
+dir.create(SUPP_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# edit to match the short names you want in the supplement
+SUPP_NAMES <- c(Global_AllCompartments = "global", Stroma = "S", CL = "CL",
+                Vascular = "V", Follicle = "F")
+
+short_of <- function(lbl)
+  if (lbl %in% names(SUPP_NAMES)) unname(SUPP_NAMES[lbl]) else lbl
+
+for (f in list.files(OUTPUT_DIR, pattern = "^GSEA_.*_Aged_vs_Young\\.csv$",
+                     recursive = TRUE, full.names = TRUE)) {
+  lbl <- sub("^GSEA_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+  file.copy(f, file.path(SUPP_DIR, paste0("allGSEA-YvA-", short_of(lbl), ".csv")),
+            overwrite = TRUE)
+}
+
+ora_file <- file.path(OUTPUT_DIR, "4_ORA", "ORA_all_tests.csv")
+if (file.exists(ora_file)) {
+  ora <- read.csv(ora_file, stringsAsFactors = FALSE)
+  for (lbl in unique(ora$test))
+    write.csv(ora[ora$test == lbl, , drop = FALSE],
+              file.path(SUPP_DIR, paste0("allORA-YvA-", short_of(lbl), ".csv")),
+              row.names = FALSE)
+}
+message("Supplementary tables written to: ", SUPP_DIR)
+#```
+
+# Appendix A. Replot and re-threshold from saved CSVs
+
+
+#No DESeq2, no fgsea. This is the whole workflow for changing `LFC_THRESHOLD`
+#(1 to 0.5, say), `PADJ_CUTOFF` or figure geometry: edit the config chunk,
+#re-run it, run this. It redraws every volcano and dotplot and rewrites the
+#three summary tables with the new cut applied.
+
+#It works because the per-gene statistics do not depend on the threshold. GSEA
+#is likewise untouched: it ranks the complete gene list by the Wald statistic,
+#so every NES and every GSEA padj is identical before and after.
+
+
+#```{r replot-from-csv, eval=FALSE}
+assert_config_current()
+
+replot_dir <- OUTPUT_DIR   # or point at a single subdir
+
+deg_files <- list.files(replot_dir, pattern = "^DEG_.*_Aged_vs_Young\\.csv$",
+                        recursive = TRUE, full.names = TRUE)
+gsea_files <- list.files(replot_dir, pattern = "^GSEA_.*_Aged_vs_Young\\.csv$",
+                         recursive = TRUE, full.names = TRUE)
+message("Found ", length(deg_files), " DEG CSVs and ",
+        length(gsea_files), " GSEA CSVs")
+
+for (f in deg_files) {
+  d <- read.csv(f, stringsAsFactors = FALSE)
+  lbl <- sub("^DEG_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+
+  # v1/v2 files carry a padj from the composite-null threshold test, or a
+  # padj_lfcthr column. Either way they cannot be replotted correctly.
+  if (!"log2FoldChange_mle" %in% names(d) || "padj_lfcthr" %in% names(d)) {
+    message("[STALE, SKIPPED] ", basename(f),
+            " predates CONFIG_VERSION 2026-08-05_v3. Its padj is not the ",
+            "plain Wald padj. Re-run the DEG chunk.")
+    next
+  }
+  if (!all(c("gene", "padj", DEG_LFC_COL) %in% names(d))) {
+    message("[SKIP] ", basename(f), " missing required columns")
+    next
+  }
+  message(basename(f))
+  plot_volcano(d,
+    title    = paste0(lbl, ": Aged vs Young (DESeq2 pseudobulk)"),
+    out_base = file.path(dirname(f), paste0("Volcano_", lbl, "_Aged_vs_Young")))
+}
+
+for (f in gsea_files) {
+  g <- read.csv(f, stringsAsFactors = FALSE)
+  lbl <- sub("^GSEA_(.*)_Aged_vs_Young\\.csv$", "\\1", basename(f))
+  if (!all(c("pathway", "NES", "padj", "size") %in% names(g))) {
+    message("[SKIP] ", basename(f), " missing required columns")
+    next
+  }
+  message(basename(f))
+  plot_gsea_dot(g,
+    title    = paste0(lbl, ": GSEA Aged vs Young"),
+    out_base = file.path(dirname(f),
+                         paste0("GSEA_dotplot_", lbl, "_Aged_vs_Young")))
+}
+
+# Re-apply the thresholds to the saved per-gene statistics and rewrite
+# DEG_summary_all_tests.csv, GSEA_summary_all_tests.csv and
+# GSEA_shared_pathways_across_tests.csv.
+rebuild_summaries_from_csv(replot_dir, OUTPUT_DIR)
+message("Replot and re-threshold done.")
+#```
+
+## Global DEG heatmap, per animal
+#Reads the saved `dds` and plots straight from it.
+## Global DEG heatmap, per animal
+
+#Reads the saved `dds` and plots straight from it. Nothing is refitted: `DESeq()`
+#already stored the dispersions and coefficients, so `results()` and `lfcShrink()`
+#here take seconds, not the minutes a re-run would.
+
+#```{r global-deg-heatmap}
+# ============================================================================
+# CONFIG
+# ============================================================================
+HM_RDS   <- file.path(OUTPUT_DIR, "0_global", "dds_Global_AllCompartments.rds")
+HM_OUT   <- file.path(OUTPUT_DIR, "0_global", "Heatmap_Global_AllDEGs")
+HM_W_MM  <- 90
+HM_H_MM  <- 120
+ 
+HM_PADJ   <- PADJ_CUTOFF      # 0.05, same object the volcano uses
+HM_LFC    <- LFC_THRESHOLD    # 1
+HM_SHRINK <- TRUE             # apeglm, matching the volcano
+ 
+# ---- COLOUR SCALE ----------------------------------------------------------
+# Three LIGHT stops, in order: negative, middle, positive. Same palette as the
+# volcano, so teal = higher in Young and purple = higher in Aged.
+HM_COLS <- c(VOLC_COLS[["Up in Young"]], "white", VOLC_COLS[["Up in Aged"]])
+ 
+# The shade reached at HM_BREAK_DARK and held for everything beyond it.
+HM_COLS_DARK <- c("#003D3D", "#5C2E8C")
+ 
+# Anchor values:
+#     0                 the middle colour (white)
+#     |HM_BREAK_LIGHT|  the light shade
+#     |HM_BREAK_DARK|   the dark shade
+#     beyond            clamped at the dark shade
+# White and the pale shades therefore span only -1 to 1. Set HM_BREAK_LIGHT to
+# NULL for a single linear stretch.
+HM_BREAK_LIGHT <- 1
+HM_BREAK_DARK  <- 3
+ 
+# Colourbar ticks: evenly spaced, roughly this many.
+HM_CBAR_N_TICKS <- 6
+# "anchors" = the bar spans only the range where colour changes
+#             (-HM_BREAK_DARK .. +HM_BREAK_DARK).
+# "full"    = the bar spans the whole data range, so the clamped region is a
+#             flat block at each end. See the note in the drawing code.
+HM_CBAR_RANGE <- "anchors"
+ 
+# ---- WHAT A CELL CONTAINS --------------------------------------------------
+# DESeq2 gives ONE log2FoldChange per gene, which is why the volcano has one
+# dot per gene. A heatmap needs a number per gene PER COLUMN, so with 8 animal
+# columns the 8 values have to come from the normalised counts. All three
+# options below are log2 quantities; they differ only in what they are measured
+# AGAINST.
+#
+#   "center" log2(normalised count + 1) minus that gene's mean across ALL 8
+#            animals. Neither age group is the reference, so young and aged
+#            both carry colour. Default, and the right match for a single
+#            dendrogram over all 8.
+#   "delta"  the same, minus the mean of the 4 YOUNG animals. Young columns
+#            then sit near zero by construction. Averaging the aged columns
+#            returns DESeq2's log2FoldChange (the printed check confirms it).
+#   "zscore" per-gene z-score. Signed, but the colour then means "SDs from this
+#            gene's own mean", not fold change.
+HM_CELL <- "center"
+ 
+# FALSE = one dendrogram over all 8 animals, order decided by the clustering.
+# TRUE  = young block left, aged block right, clustered within each block.
+HM_COL_SPLIT <- FALSE
+ 
+# Left NULL the legend title follows HM_CELL. Set a string to override.
+HM_LEGEND_TITLE <- NULL
+ 
+# ============================================================================
+# PLOTTING FUNCTIONS (base graphics only, no new packages)
+# ============================================================================
+# =============================================================================
+# make_breakpoint_palette
+#
+# A colour scale with EXPLICIT anchor values rather than one linear stretch:
+#
+#     0             mid colour (white)
+#     |break_light| the light shade   (default 1)
+#     |break_dark|  the dark shade    (default 3)
+#     beyond        clamped at the dark shade
+#
+# The value -> POSITION mapping stays linear; only value -> COLOUR is
+# piecewise. That keeps tick placement arithmetic simple and correct.
+# =============================================================================
+make_breakpoint_palette <- function(n, vlim,
+                                    cols_light, cols_dark,
+                                    break_light = 1, break_dark = 3) {
+  stopifnot(length(cols_light) == 3, length(cols_dark) == 2)
+  stopifnot(break_dark > break_light, break_light > 0)
+  edges   <- seq(-vlim, vlim, length.out = n + 1)
+  centres <- (edges[-1] + edges[-(n + 1)]) / 2
+ 
+  a <- pmin(abs(centres), break_dark)            # clamp past the dark anchor
+  f <- ifelse(a <= break_light,
+              (a / break_light) * 0.5,           # 0 .. 0.5  mid  -> light
+              0.5 + (a - break_light) /
+                    (break_dark - break_light) * 0.5)  # 0.5 .. 1 light -> dark
+ 
+  # colorRamp with three stops puts the middle stop exactly at 0.5, which is
+  # why f is built on that scale: f = 0.5 lands on the light shade by
+  # construction rather than by arithmetic that could drift.
+  ramp_neg <- grDevices::colorRamp(c(cols_light[2], cols_light[1], cols_dark[1]))
+  ramp_pos <- grDevices::colorRamp(c(cols_light[2], cols_light[3], cols_dark[2]))
+ 
+  m <- matrix(NA_real_, n, 3)
+  neg <- centres < 0
+  if (any(neg))  m[neg, ]  <- ramp_neg(f[neg])
+  if (any(!neg)) m[!neg, ] <- ramp_pos(f[!neg])
+  grDevices::rgb(m[, 1], m[, 2], m[, 3], maxColorValue = 255)
+}
+ 
+# =============================================================================
+# plot_deg_heatmap: genes x animals, base graphics only.
+# =============================================================================
+plot_deg_heatmap <- function(M, age_group, out_base,
+                             col_split = FALSE,
+                             w_mm = 90, h_mm = 120,
+                             cols = c("#007A7A", "white", "#B57BEE"),
+                             cols_dark = c("#003D3D", "#5C2E8C"),
+                             break_light = 1, break_dark = 3,
+                             legend_title = "log2 vs mean",
+                             line_lwd = 0.4,
+                             n_colours = 255,
+                             vlim = NULL, dpi = 600,
+                             row_dend_frac = 0.12, col_dend_frac = 0.08,
+                             cbar_frac = 0.20,
+                             cbar_n_ticks = 6,
+                             cbar_range = "anchors",
+                             axis_cex  = 0.50,
+                             cbar_cex  = 0.50,
+                             cbar_title_cex = NULL,
+                             title_cex = 0.50,
+                             axis_srt = 0,
+                             cbar_top = 0.88, cbar_height = 0.25,
+                             cbar_title_lines_max = 4,
+                             main = NULL) {
+ 
+  stopifnot(ncol(M) == length(age_group))
+  young <- which(age_group == "Young")
+  aged  <- which(age_group != "Young")
+  if (is.null(cbar_title_cex)) cbar_title_cex <- cbar_cex
+ 
+  keep <- apply(M, 1, function(x) stats::sd(x, na.rm = TRUE) > 1e-12)
+  if (sum(!keep)) message("  dropping ", sum(!keep),
+                          " gene(s) with no variance across animals")
+  M <- M[keep, , drop = FALSE]
+ 
+  cor_dist <- function(A) stats::as.dist(1 - stats::cor(t(A)))
+  hr <- stats::hclust(cor_dist(M), method = "average")
+  row_ord <- hr$order
+ 
+  block_ord <- function(idx) {
+    if (length(idx) < 2) return(list(ord = idx, hc = NULL))
+    hc <- stats::hclust(cor_dist(t(M[, idx, drop = FALSE])), method = "average")
+    list(ord = idx[hc$order], hc = hc)
+  }
+  if (col_split) { by <- block_ord(young); ba <- block_ord(aged)
+  } else { by <- block_ord(seq_len(ncol(M))); ba <- list(ord = integer(0), hc = NULL) }
+  col_ord <- c(by$ord, ba$ord)
+ 
+  D <- M[row_ord, col_ord, drop = FALSE]
+  if (is.null(vlim)) vlim <- max(abs(D), na.rm = TRUE)
+  brk <- seq(-vlim, vlim, length.out = n_colours + 1)
+ 
+  use_breaks <- !is.null(break_light) && !is.null(break_dark) &&
+                break_dark > break_light && break_light > 0
+  if (use_breaks) {
+    if (break_dark > vlim)
+      message("  [NOTE] break_dark (", break_dark, ") exceeds the data range (",
+              sprintf("%.2f", vlim), "); the dark shade is never reached.")
+    pal <- make_breakpoint_palette(n_colours, vlim, cols, cols_dark,
+                                   break_light, break_dark)
+    n_clamped <- sum(abs(D) > break_dark, na.rm = TRUE)
+    message("  colour anchors: 0 = mid, |", break_light, "| = light, |",
+            break_dark, "| = dark, beyond clamped (",
+            n_clamped, " of ", length(D), " cells, ",
+            sprintf("%.1f%%", 100 * n_clamped / length(D)), ")")
+  } else {
+    pal <- grDevices::colorRampPalette(cols)(n_colours)
+  }
+ 
+  wrap_to_width <- function(txt, max_w, cex, max_lines) {
+    words <- strsplit(txt, "\\s+")[[1]]
+    lines <- character(0); cur <- ""
+    for (w in words) {
+      cand <- if (nzchar(cur)) paste(cur, w) else w
+      if (graphics::strwidth(cand, cex = cex) <= max_w || !nzchar(cur)) {
+        cur <- cand
+      } else { lines <- c(lines, cur); cur <- w }
+    }
+    lines <- c(lines, cur)
+    if (length(lines) > max_lines)
+      return(list(lines = txt, cex = cex * max_w /
+                    max(graphics::strwidth(txt, cex = cex), 1e-9)))
+    list(lines = lines, cex = cex)
+  }
+ 
+  draw <- function() {
+    op <- par(no.readonly = TRUE); on.exit(par(op), add = TRUE)
+    par(oma = c(0, 0, if (is.null(main)) 0.6 else 2.0, 0))
+    split_on <- length(ba$ord) > 0
+    lay <- if (split_on) rbind(c(0, 1, 2, 0), c(3, 4, 4, 5)) else
+                         rbind(c(0, 1, 0), c(2, 3, 4))
+    nc <- ncol(D)
+    graphics::layout(lay,
+      widths  = if (split_on)
+                  c(row_dend_frac * nc, length(by$ord), length(ba$ord),
+                    cbar_frac * nc)
+                else c(row_dend_frac * nc, length(by$ord), cbar_frac * nc),
+      heights = c(col_dend_frac, 1))
+ 
+    hm_mar_b <- 2.0
+    dend <- function(hc, horiz = FALSE, n_leaf = NULL) {
+      par(mar = if (horiz) c(hm_mar_b, 0, 0, 0) else c(0, 0, 0, 0),
+          lwd = line_lwd)
+      if (is.null(hc)) { plot.new(); return(invisible()) }
+      d <- stats::as.dendrogram(hc)
+      if (horiz) plot(rev(d), horiz = TRUE, axes = FALSE, yaxs = "i",
+                      leaflab = "none", ylim = c(0.5, n_leaf + 0.5),
+                      xlim = c(attr(d, "height"), 0))
+      else plot(d, axes = FALSE, xaxs = "i", leaflab = "none")
+    }
+    dend(by$hc)
+    if (length(ba$ord)) dend(ba$hc)
+    dend(hr, horiz = TRUE, n_leaf = nrow(D))
+ 
+    par(mar = c(hm_mar_b, 0, 0, 0), lwd = line_lwd)
+    graphics::image(x = seq_len(ncol(D)), y = seq_len(nrow(D)),
+                    z = t(D), col = pal, breaks = brk,
+                    ylim = c(0.5, nrow(D) + 0.5), yaxs = "i",
+                    axes = FALSE, xlab = "", ylab = "", useRaster = TRUE)
+    box(lwd = line_lwd)
+    usr <- par("usr")
+    text(x = seq_len(ncol(D)), y = usr[3] - (usr[4] - usr[3]) * 0.012,
+         labels = colnames(D), srt = axis_srt, adj = c(0.5, 1),
+         cex = axis_cex, xpd = NA)
+ 
+    # ---- colourbar ---------------------------------------------------
+    par(mar = c(0, 0.6, 0, 0.6), lwd = line_lwd)
+    plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
+    y1 <- cbar_top; y0 <- cbar_top - cbar_height
+ 
+    # WHAT RANGE THE BAR SPANS.
+    #   "anchors" (default) the bar runs -break_dark .. +break_dark, i.e. only
+    #                       the range where the colour actually changes.
+    #   "full"              the bar runs -vlim .. +vlim, so the clamped region
+    #                       is drawn as a flat block at each end.
+    # This matters once ticks are evenly spaced. With "full" and vlim = 8 the
+    # ticks land at 8, 4, 0, -4, -8, and 4 and 8 point at IDENTICAL colour,
+    # which tells the reader they can distinguish values that the scale has
+    # already merged. "anchors" removes the flat band instead of labelling it.
+    bar_hi <- if (use_breaks && cbar_range == "anchors") break_dark else vlim
+    bar_pal <- if (use_breaks && cbar_range == "anchors")
+                 make_breakpoint_palette(n_colours, bar_hi, cols, cols_dark,
+                                         break_light, break_dark)
+               else pal
+ 
+    yy <- seq(y0, y1, length.out = n_colours + 1)
+    rect(0.05, yy[-length(yy)], 0.45, yy[-1], col = bar_pal, border = NA)
+    rect(0.05, y0, 0.45, y1, border = "black", lwd = line_lwd)
+ 
+    # Evenly spaced ticks. pretty() over a symmetric range returns a symmetric,
+    # evenly spaced set, so 0 and the anchors still land on ticks whenever the
+    # spacing divides them.
+    tk  <- pretty(c(-bar_hi, bar_hi), cbar_n_ticks)
+    tk  <- tk[abs(tk) <= bar_hi + 1e-9]
+    lab <- format(tk)
+    if (use_breaks && vlim > break_dark) {
+      # The extremes are clamped, so the end labels say so rather than
+      # implying the bar stops where the data stop.
+      lab[which.max(tk)] <- paste0(">=", format(max(tk)))
+      lab[which.min(tk)] <- paste0("<=", format(min(tk)))
+    }
+    ty <- y0 + (tk + bar_hi) / (2 * bar_hi) * (y1 - y0)
+    segments(0.45, ty, 0.52, ty, lwd = line_lwd)
+    text(0.56, ty, lab, adj = 0, cex = cbar_cex, xpd = NA)
+ 
+    wr <- wrap_to_width(legend_title, 0.96, cbar_title_cex,
+                        cbar_title_lines_max)
+    lh <- graphics::strheight("Ag", cex = wr$cex) * 1.25
+    for (i in seq_along(wr$lines))
+      text(0.02, y1 + 0.02 + lh * (length(wr$lines) - i),
+           wr$lines[i], adj = c(0, 0), cex = wr$cex, xpd = NA)
+    if (!is.null(main)) mtext(main, outer = TRUE, cex = title_cex, line = 0.2)
+  }
+ 
+  w_in <- w_mm / 25.4; h_in <- h_mm / 25.4
+  grDevices::png(paste0(out_base, ".png"), width = w_in, height = h_in,
+                 units = "in", res = dpi, bg = "white"); draw(); grDevices::dev.off()
+  ok <- TRUE
+  if (requireNamespace("svglite", quietly = TRUE)) {
+    svglite::svglite(paste0(out_base, ".svg"), width = w_in, height = h_in)
+    draw(); grDevices::dev.off()
+  } else {
+    ok <- tryCatch({
+      grDevices::svg(paste0(out_base, ".svg"), width = w_in, height = h_in,
+                     bg = "white"); draw(); grDevices::dev.off(); TRUE
+    }, error = function(e) { message("  SVG failed: ", conditionMessage(e)); FALSE })
+  }
+  message("  wrote ", basename(out_base), ".png",
+          if (ok) paste0(" + ", basename(out_base), ".svg") else "",
+          "  (", nrow(D), " genes x ", ncol(D), " animals, ",
+          w_mm, " x ", h_mm, " mm)")
+  invisible(list(matrix = D, row_hclust = hr, vlim = vlim, palette = pal))
+}
+ 
+# ============================================================================
+# 1. READ THE STORED FIT
+# DESeq2 is already attached by the setup chunk, so these are called plainly;
+# SummarizedExperiment (which provides colData) comes with it.
+# ============================================================================
+stopifnot(file.exists(HM_RDS))
+dds <- readRDS(HM_RDS)
+message("dds: ", nrow(dds), " genes x ", ncol(dds), " pseudobulk samples")
+ 
+res <- results(dds, contrast = c("age_group", "Aged", "Young"), alpha = HM_PADJ)
+if (HM_SHRINK) {
+  # Same two lines the DEG chunk uses, so the log2FC here is the log2FC there.
+  coef_name <- resultsNames(dds)[grepl("age_group", resultsNames(dds))]
+  res <- lfcShrink(dds, coef = coef_name, type = "apeglm", quiet = TRUE)
+}
+rdf <- as.data.frame(res)
+rdf$gene <- rownames(rdf)
+ 
+deg <- rdf$gene[!is.na(rdf$padj) & rdf$padj < HM_PADJ &
+                  abs(rdf$log2FoldChange) > HM_LFC]
+message("DEGs at padj < ", HM_PADJ, " and |log2FC| > ", HM_LFC, ": ",
+        length(deg), "  (", sum(rdf$log2FoldChange[match(deg, rdf$gene)] > 0),
+        " up / ", sum(rdf$log2FoldChange[match(deg, rdf$gene)] < 0), " down)")
+stopifnot(length(deg) >= 2)
+ 
+# ============================================================================
+# 2. PER-ANIMAL VALUES
+# ============================================================================
+# counts(normalized = TRUE) applies the median-of-ratios size factors that
+# DESeq2 already estimated, so the heatmap and the DEG call share one
+# normalisation and cannot drift apart.
+nc  <- counts(dds, normalized = TRUE)[deg, , drop = FALSE]
+lg  <- log2(nc + 1)
+cd  <- as.data.frame(colData(dds))
+age <- as.character(cd$age_group)
+colnames(lg) <- if (!is.null(cd$animal_id)) as.character(cd$animal_id) else
+  sub("__.*", "", colnames(lg))
+ 
+if (HM_CELL == "zscore") {
+  M <- t(scale(t(lg)))
+  ttl <- "z-score"
+} else if (HM_CELL == "delta") {
+  young_cols <- which(age == "Young")
+  stopifnot(length(young_cols) >= 2)
+  M <- lg - rowMeans(lg[, young_cols, drop = FALSE])
+  ttl <- "log2 vs young"
+} else {
+  M <- lg - rowMeans(lg)
+  ttl <- "log2 vs mean"
+}
+if (!is.null(HM_LEGEND_TITLE)) ttl <- HM_LEGEND_TITLE
+ 
+# Sanity check, reported rather than assumed: rebuilding the contrast from the
+# per-animal columns should reproduce DESeq2's own estimate. If it does not,
+# the figure and the statistics are describing different things.
+if (HM_CELL %in% c("delta", "center")) {
+  # Subtracting a per-gene constant cancels in a group difference, so this
+  # check is identical for "delta" and "center".
+  approx <- rowMeans(M[, age != "Young", drop = FALSE]) -
+            rowMeans(M[, age == "Young", drop = FALSE])
+  rr <- suppressWarnings(
+    stats::cor(approx, rdf$log2FoldChange[match(rownames(M), rdf$gene)],
+               use = "complete.obs"))
+  message("per-animal construction vs DESeq2 log2FC: Pearson r = ",
+          sprintf("%.3f", rr))
+  if (!is.na(rr) && rr < 0.8)
+    warning("r < 0.8: the columns and the DESeq2 estimate disagree. ",
+            "Do not use this figure until that is resolved.")
+}
+ 
+# ============================================================================
+# 3. DRAW
+# ============================================================================
+res_hm <- plot_deg_heatmap(
+  M, age, HM_OUT, col_split = HM_COL_SPLIT,
+  w_mm = HM_W_MM, h_mm = HM_H_MM,
+  cols = HM_COLS, cols_dark = HM_COLS_DARK,
+  break_light = HM_BREAK_LIGHT, break_dark = HM_BREAK_DARK,
+  cbar_n_ticks = HM_CBAR_N_TICKS, cbar_range = HM_CBAR_RANGE,
+  legend_title = ttl,
+  main = paste0("Global: all DEGs (", nrow(M), " genes)\naged vs young"))
+ 
+write.csv(res_hm$matrix, paste0(HM_OUT, ".csv"))
+message("Saved: ", HM_OUT, ".png / .svg / .csv")
+```
+

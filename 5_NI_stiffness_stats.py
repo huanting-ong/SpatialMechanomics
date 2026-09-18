@@ -58,20 +58,21 @@ Note
     nothing.
 """
 
+
 from pathlib import Path
 import sys
-
+ 
 import numpy as np
 import pandas as pd
 from scipy.stats import mannwhitneyu, ttest_ind
-
+ 
 import statsmodels.formula.api as smf
 from patsy import dmatrix
-
+ 
 # =============================================================================
 # CONFIG
 # =============================================================================
-
+ 
 # ---- WHERE THE DATA COMES FROM ----------------------------------------------
 # Mode "points"  : the per-bin table with nanoindentation values merged in.
 #                  Has compartments, so it can answer Q1 and Q2, but only
@@ -80,14 +81,23 @@ from patsy import dmatrix
 #                  No compartments, so Q1 only, but covers every ovary you
 #                  have ever indented, which is what Q1 should use.
 MODE = "points"
-
+ 
+# The expression-matched bin table, NOT metadata_with_nano.tsv.
+#
+# metadata_with_nano.tsv holds every bin assigned to a grid point, including
+# bins that carry no transcriptome. Computing a point's compartment fraction
+# over those bins uses a different denominator from the correlation and
+# positive-control scripts, which run on the expression-matched bins only, and
+# moves about twelve points across the 50% threshold. Every point in this paper
+# is a paired point, so the expression-matched set is the correct universe and
+# all three scripts now share it.
 POINTS_TSV = Path(
     r"Z:\Visium_Data\001_SpatialX\20260803_FinalAnnotatedMetadata"
-    r"\metadata_with_nano.tsv")
+    r"\expression_export\step9_expression_metadata_matched.tsv")
 CURVES_ROOT = Path(r"Z:\Nanoindentation\Ting-Nanoindentation2025")
-
+ 
 OUT_DIR = Path(__file__).resolve().parent / "stiffness_stats"
-
+ 
 # ---- THE SAMPLE SHEET -------------------------------------------------------
 # key   = the slice or ROI label as it appears in the data
 # ovary = the ovary that label came from
@@ -120,7 +130,7 @@ SAMPLE_SHEET = [
     ("A6-1",   "A6",  "mA6",  "aged"),
     ("A6-2",   "A6",  "mA6",  "aged"),
 ]
-
+ 
 # ---- COLUMN NAMES IN THE POINTS TABLE ---------------------------------------
 # Each is a list of candidates. The first one present in the file is used, and
 # if none is found the script prints every column in the file and stops, so a
@@ -137,15 +147,15 @@ COL_SLICE_CANDIDATES = ["Tissue.slices", "Tissue_slices", "Tissue slices",
 # Candidates for the compartment column. First one present is used.
 COL_COMPARTMENT_CANDIDATES = ["compartment", "Compartment", "compartments",
                               "Compartments", "compartment_4", "Region"]
-
+ 
 COMPARTMENT_ORDER = ["CL", "S", "V", "F"]
 COMPARTMENT_MIN_FRAC = 0.50   # matches the Methods
-
+ 
 VALID_MIN, VALID_MAX = 7.6, 22726.0
 PERR_MAX = 0.15
 ENCODINGS = ["utf-8-sig", "cp1252", "latin-1"]
-
-
+ 
+ 
 # =============================================================================
 def sheet_frame():
     s = pd.DataFrame(SAMPLE_SHEET, columns=["key", "ovary", "animal", "age"])
@@ -158,8 +168,8 @@ def sheet_frame():
             sys.exit(f"SAMPLE_SHEET: ovary maps to >1 {col}: "
                      f"{list(bad[bad > 1].index)}")
     return s
-
-
+ 
+ 
 def read_any(path, **kw):
     for enc in ENCODINGS:
         try:
@@ -167,8 +177,8 @@ def read_any(path, **kw):
         except UnicodeDecodeError:
             continue
     raise UnicodeDecodeError(f"could not decode {path}")
-
-
+ 
+ 
 def pick_col(df, candidates, what, required=True):
     """First candidate present, or a readable failure listing what is there."""
     for c in candidates:
@@ -182,19 +192,19 @@ def pick_col(df, candidates, what, required=True):
     for c in df.columns:
         print(f"          {c}")
     sys.exit(1)
-
-
+ 
+ 
 def load_points(sheet):
     """Per-measurement table with compartment, from the merged metadata."""
     d = read_any(POINTS_TSV, sep="\t", low_memory=False)
-
+ 
     col_e = pick_col(d, COL_STIFFNESS_CANDIDATES, "stiffness")
     col_roi = pick_col(d, COL_ROI_CANDIDATES, "ROI")
     col_pt = pick_col(d, COL_POINT_CANDIDATES, "nanoindentation point id")
     col_sl = pick_col(d, COL_SLICE_CANDIDATES, "tissue slice", required=False)
     comp_col = pick_col(d, COL_COMPARTMENT_CANDIDATES, "compartment",
                         required=False)
-
+ 
     print(f"  stiffness   -> {col_e}")
     print(f"  ROI         -> {col_roi}")
     print(f"  point id    -> {col_pt}")
@@ -206,13 +216,13 @@ def load_points(sheet):
             if any(k in c.lower() for k in
                    ("comp", "region", "cluster", "anno", "cell")):
                 print(f"      {c}")
-
+ 
     d[col_e] = pd.to_numeric(d[col_e], errors="coerce")
     d = d[d[col_e].between(VALID_MIN, VALID_MAX)].copy()
-
+ 
     pid = d[col_pt].astype(str).str.strip()
     d = d[~pid.isin(["N/A", "nan", "", "None"])].copy()
-
+ 
     parts = [d[col_roi].astype(str).str.strip(),
              d[col_pt].astype(str).str.strip()]
     if col_sl is not None:
@@ -220,7 +230,7 @@ def load_points(sheet):
     d["_point"] = parts[0]
     for p in parts[1:]:
         d["_point"] = d["_point"] + "|" + p
-
+ 
     rows = []
     for pt, g in d.groupby("_point"):
         roi = str(g[col_roi].iloc[0]).strip()
@@ -238,7 +248,7 @@ def load_points(sheet):
     if pts.empty:
         sys.exit("No measurements survived the key check.")
     pts = pts[pts["n_bins"] >= 5]
-
+ 
     merged = pts.merge(sheet, on="key", how="inner")
     lost = sorted(set(pts["key"]) - set(sheet["key"]))
     if lost:
@@ -246,8 +256,8 @@ def load_points(sheet):
               f"from SAMPLE_SHEET and were dropped:")
         print(f"         {lost}")
     return merged
-
-
+ 
+ 
 def load_curves(sheet):
     """Every indentation from every labelled slice folder. No compartments."""
     frames = []
@@ -286,8 +296,8 @@ def load_curves(sheet):
         sys.exit("No slice folders matched SAMPLE_SHEET keys.")
     return pd.concat(frames, ignore_index=True).merge(sheet, on="key",
                                                       how="inner")
-
-
+ 
+ 
 # =============================================================================
 def fit_mixed(df, formula):
     """Random intercepts for animal, ovary within animal, ROI within ovary."""
@@ -295,11 +305,11 @@ def fit_mixed(df, formula):
     md = smf.mixedlm(formula, df, groups=df["animal"], vc_formula=vc,
                      re_formula="1")
     return md.fit(reml=True, method="lbfgs")
-
-
+ 
+ 
 def report_variance(res):
     """Print the variance components.
-
+ 
     statsmodels warns 'MLE may be on the boundary' whenever a component is
     driven to zero, which is common with few animals. A component at zero
     means that level of nesting is contributing nothing and the effect above
@@ -313,11 +323,11 @@ def report_variance(res):
         label = {"Group Var": "animal"}.get(k, k.replace(" Var", ""))
         flag = "   <- collapsed to zero" if v < 1e-6 else ""
         print(f"    {label:<8s} {v:.6f}{flag}")
-
-
+ 
+ 
 def contrast(res, di, cell_a, cell_b):
     """Difference between two cells of the age x compartment design.
-
+ 
     MixedLMResults.t_test wants a 2D matrix with exactly one column per fixed
     effect. res.params also carries the variance components, so the contrast
     has to be trimmed to the fixed effects and reshaped, not padded.
@@ -332,8 +342,8 @@ def contrast(res, di, cell_a, cell_b):
     return (float(np.ravel(t.effect)[0]),
             float(np.ravel(t.sd)[0]),
             float(np.ravel(t.pvalue)[0]))
-
-
+ 
+ 
 def holm(p):
     p = np.asarray(p, float)
     o = np.argsort(p)
@@ -343,8 +353,8 @@ def holm(p):
         run = max(run, (len(p) - i) * p[j])
         adj[j] = min(run, 1.0)
     return adj
-
-
+ 
+ 
 # =============================================================================
 def q1(df):
     print("\n" + "=" * 72)
@@ -354,7 +364,7 @@ def q1(df):
     n_ov = df.groupby("age")["ovary"].nunique().to_dict()
     print(f"  indentations: {len(df):,}   "
           f"ovaries: {n_ov}   animals: {n_an}")
-
+ 
     res = fit_mixed(df, "log10E ~ C(age, Treatment('young'))")
     report_variance(res)
     name = [p for p in res.fe_params.index if "age" in p][0]
@@ -363,7 +373,7 @@ def q1(df):
     print(f"    effect {eff:+.4f} log10 units  "
           f"({10**eff:.2f}-fold)   SE {se:.4f}   p = {pv:.4g}")
     print(f"    95% CI {10**(eff-1.96*se):.2f} to {10**(eff+1.96*se):.2f}-fold")
-
+ 
     ov = df.groupby(["ovary", "age"])["log10E"].mean().reset_index()
     y = ov.loc[ov["age"] == "young", "log10E"].values
     a = ov.loc[ov["age"] == "aged", "log10E"].values
@@ -378,8 +388,8 @@ def q1(df):
     print("  the other two, its variance components are unstable and the")
     print("  per-ovary tests are the ones to report.")
     return res
-
-
+ 
+ 
 def q2(df):
     d = df.dropna(subset=["compartment"])
     d = d[d["compartment"].isin(COMPARTMENT_ORDER)].copy()
@@ -390,13 +400,13 @@ def q2(df):
     print("Q2  DO COMPARTMENTS DIFFER, WITHIN AND BETWEEN AGE GROUPS?")
     print("=" * 72)
     print(pd.crosstab(d["compartment"], d["age"]).to_string())
-
+ 
     f = ("log10E ~ C(age, Treatment('young')) * "
          "C(compartment, Treatment('S'))")
     res = fit_mixed(d, f)
     report_variance(res)
     di = dmatrix(f.split("~")[1].strip(), d, return_type="dataframe").design_info
-
+ 
     rows = []
     for age in ("young", "aged"):
         present = sorted(set(d.loc[d["age"] == age, "compartment"]),
@@ -414,7 +424,7 @@ def q2(df):
                                dict(age="young", compartment=c))
             rows.append(dict(family="aged vs young", a=f"aged {c}",
                              b=f"young {c}", diff_log10=e, se=s, p=p))
-
+ 
     out = pd.DataFrame(rows)
     out["p_holm"] = np.nan
     for fam, g in out.groupby("family"):
@@ -425,11 +435,11 @@ def q2(df):
                                float_format=lambda v: f"{v:.4g}"))
     print("\n  p_holm is corrected within each family, not across all three.")
     return out
-
-
+ 
+ 
 def write_prism(df):
     """One column per ovary x compartment, ragged, ready to paste into Prism.
-
+ 
     ROIs are collapsed, so every measurement from A6-1 and A6-2 that landed in
     stroma appears in a single A6-S column. Columns run young before aged, and
     CL, S, V, F within each ovary, which is the left-to-right order of the
@@ -442,10 +452,10 @@ def write_prism(df):
     if d.empty:
         print("\n[SKIP] Prism export: no compartment labels.")
         return
-
+ 
     order = (d[["ovary", "age"]].drop_duplicates()
              .sort_values(["age", "ovary"], ascending=[False, True]))
-
+ 
     cols = {}
     for ov in order["ovary"]:
         for comp in COMPARTMENT_ORDER:
@@ -453,16 +463,16 @@ def write_prism(df):
                       "stiffness"].dropna().values
             if len(v):
                 cols[f"{ov}-{comp}"] = np.sort(v)
-
+ 
     n = max(len(v) for v in cols.values())
     wide = pd.DataFrame({k: np.concatenate([v, np.full(n - len(v), np.nan)])
                          for k, v in cols.items()})
-
+ 
     f_pa = OUT_DIR / "prism_stiffness_by_ovary_compartment_Pa.csv"
     f_kpa = OUT_DIR / "prism_stiffness_by_ovary_compartment_kPa.csv"
     wide.to_csv(f_pa, index=False)
     (wide / 1000.0).to_csv(f_kpa, index=False)
-
+ 
     print("\n" + "=" * 72)
     print("PRISM EXPORT")
     print("=" * 72)
@@ -477,11 +487,11 @@ def write_prism(df):
     print(f"  kPa : {f_kpa.name}   (Fig. 2b axis is in kPa)")
     print("\n  Blank cells are missing values, not zeros. In Prism use a")
     print("  Grouped table and paste with 'Insert replicates down columns'.")
-
-
+ 
+ 
 def write_prism_nested(df):
     """Block for a Prism Nested table: 8 groups x 4 ovary subcolumns.
-
+ 
     Groups run young CL, S, V, F then aged CL, S, V, F, left to right, which
     is the intended figure order. Within each group the four subcolumns are
     the four ovaries of that age, always in the same order, so an ovary with
@@ -494,10 +504,10 @@ def write_prism_nested(df):
     if d.empty:
         print("\n[SKIP] nested export: no compartment labels.")
         return
-
+ 
     ov_by_age = {a: sorted(d.loc[d["age"] == a, "ovary"].unique())
                  for a in ("young", "aged")}
-
+ 
     cols, headers = {}, []
     for age in ("young", "aged"):
         for comp in COMPARTMENT_ORDER:
@@ -506,14 +516,14 @@ def write_prism_nested(df):
                           "stiffness"].dropna().values
                 cols[f"{age}_{comp}_{ov}"] = np.sort(v)
                 headers.append((f"{age} {comp}", ov, len(v)))
-
+ 
     n = max(len(v) for v in cols.values())
     wide = pd.DataFrame({k: np.concatenate([v, np.full(n - len(v), np.nan)])
                          for k, v in cols.items()})
-
+ 
     f = OUT_DIR / "prism_NESTED_stiffness_kPa.csv"
     (wide / 1000.0).to_csv(f, index=False)
-
+ 
     n_ov = len(ov_by_age["young"])
     print("\n" + "=" * 72)
     print("PRISM NESTED EXPORT")
@@ -530,8 +540,105 @@ def write_prism_nested(df):
           f"{len(wide.columns)//n_ov} groups with {n_ov} subcolumns each,")
     print("  then paste the whole block into the first cell. Empty")
     print("  subcolumns are intentional and keep the groups aligned.")
-
-
+ 
+ 
+def write_prism_geomeans(df):
+    """Per-ovary geometric mean per compartment, one column per group, in the
+    same left-to-right order as the nested export. Paste into a second Prism
+    graph with identical axis limits and log scale, then overlay the two in
+    Illustrator.
+ 
+    Geometric, not arithmetic: the axis is log and the model is fitted on
+    log10 stiffness, so the arithmetic mean of right-skewed values would sit
+    above most of the points.
+    """
+    d = df.dropna(subset=["compartment"])
+    d = d[d["compartment"].isin(COMPARTMENT_ORDER)]
+    if d.empty:
+        print("\n[SKIP] geometric means: no compartment labels.")
+        return
+ 
+    g = (d.groupby(["age", "ovary", "compartment"])["stiffness"]
+           .agg(n="size", kPa=lambda s: np.exp(np.log(s).mean()) / 1000.0)
+           .reset_index())
+    g["_a"] = g["age"].map({"young": 0, "aged": 1})
+    g["_c"] = g["compartment"].map({c: i for i, c in
+                                    enumerate(COMPARTMENT_ORDER)})
+    g = g.sort_values(["_a", "_c", "ovary"]).drop(columns=["_a", "_c"])
+ 
+    print("\n" + "=" * 72)
+    print("PER-OVARY GEOMETRIC MEANS")
+    print("=" * 72)
+    print(g.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+ 
+    cols = {}
+    for age in ("young", "aged"):
+        for comp in COMPARTMENT_ORDER:
+            sub = g[(g["age"] == age) & (g["compartment"] == comp)]
+            if len(sub):
+                cols[f"{age}-{comp}"] = sub["kPa"].values
+ 
+    n = max(len(v) for v in cols.values())
+    wide = pd.DataFrame({k: np.concatenate([v, np.full(n - len(v), np.nan)])
+                         for k, v in cols.items()})
+    f = OUT_DIR / "prism_ovary_geomeans_kPa.csv"
+    wide.to_csv(f, index=False)
+    g.to_csv(OUT_DIR / "per_ovary_compartment_geomeans.csv", index=False)
+ 
+    print(f"\n  {len(wide.columns)} column(s), longest {n} value(s)")
+    missing = [f"{a}-{c}" for a in ("young", "aged")
+               for c in COMPARTMENT_ORDER if f"{a}-{c}" not in cols]
+    if missing:
+        print(f"  [NOTE] no data for: {', '.join(missing)}")
+    short = [c for c in wide.columns if wide[c].notna().sum() < n]
+    if short:
+        print("  Groups with fewer ovaries than the maximum, so a missing "
+              "circle is a real absence:")
+        for c in short:
+            print(f"    {c}: {int(wide[c].notna().sum())} of {n}")
+    print(f"\n  {f.name}")
+ 
+ 
+def write_prism_pooled(df):
+    """All indentations of one age and compartment in a single column, ROIs
+    and ovaries collapsed. Eight columns, young then aged within each
+    compartment, matching the figure order. kPa only.
+ 
+    Use this for the point cloud and overlay the per-ovary geometric means
+    from prism_ovary_geomeans_kPa.csv on top.
+    """
+    d = df.dropna(subset=["compartment"])
+    d = d[d["compartment"].isin(COMPARTMENT_ORDER)]
+    if d.empty:
+        print("\n[SKIP] pooled export: no compartment labels.")
+        return
+ 
+    cols = {}
+    for comp in COMPARTMENT_ORDER:
+        for age in ("young", "aged"):
+            v = d.loc[(d["compartment"] == comp) & (d["age"] == age),
+                      "stiffness"].dropna().values
+            if len(v):
+                cols[f"{age}-{comp}"] = np.sort(v) / 1000.0
+ 
+    n = max(len(v) for v in cols.values())
+    wide = pd.DataFrame({k: np.concatenate([v, np.full(n - len(v), np.nan)])
+                         for k, v in cols.items()})
+    f = OUT_DIR / "prism_pooled_by_age_compartment_kPa.csv"
+    wide.to_csv(f, index=False)
+ 
+    print("\n" + "=" * 72)
+    print("PRISM POOLED EXPORT")
+    print("=" * 72)
+    counts = wide.notna().sum()
+    for c in wide.columns:
+        print(f"    {c:<12s} {counts[c]:>6,} indentations")
+    print(f"\n  {len(wide.columns)} columns, longest {n:,} values")
+    print(f"  {f.name}")
+    print("\n  Blank cells are missing values, not zeros. In Prism use a")
+    print("  Column table and paste the whole block into the first cell.")
+ 
+ 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     sheet = sheet_frame()
@@ -539,18 +646,20 @@ def main():
     df["log10E"] = np.log10(df["stiffness"])
     df = df.dropna(subset=["log10E"])
     print(f"MODE {MODE}   {len(df):,} observations")
-
+ 
     q1(df)
     tab = q2(df) if MODE == "points" else None
-
+ 
     write_prism(df)
     write_prism_nested(df)
-
+    write_prism_geomeans(df)
+    write_prism_pooled(df)
+ 
     df.to_csv(OUT_DIR / "stiffness_observations.csv", index=False)
     if tab is not None:
         tab.to_csv(OUT_DIR / "compartment_contrasts.csv", index=False)
     print(f"\nWritten to {OUT_DIR}")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
