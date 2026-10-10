@@ -687,15 +687,15 @@ def ProcessFile(filepath):
             return 'skipped-too-few-trimmed'
 
         #=============================   ENERGY ================================
-        energy_l = np.abs(np.trapz(force_ll-of,x=ind_ll)) # x is ranging from max to 
-        energy_r = np.abs(np.trapz(force_rr-of, x=ind_rr))
+        energy_l = np.abs(np.trapezoid(force_ll-of,x=ind_ll)) # x is ranging from max to 
+        energy_r = np.abs(np.trapezoid(force_rr-of, x=ind_rr))
         loss = (energy_l-energy_r)/energy_l
         ind_rn = ind_r[finish:]
         force_rn = force_r[finish:]
         sel = np.where(force_rn<0)[0]
         #plt.plot(ind_rn[sel],force_rn[sel])
         if len(sel)>0:
-            energy_a = np.abs(np.trapz(force_rn[sel],x=ind_rn[sel]))
+            energy_a = np.abs(np.trapezoid(force_rn[sel],x=ind_rn[sel]))
         else:
             energy_a = 0
         print('Eng_a',energy_l,'fJ','Eng_r',energy_r,'fJ','WorkLoss',loss,'Adhesive energy:',energy_a, 'fJ', energy_a/energy_l) 
@@ -885,8 +885,8 @@ def ProcessFile(filepath):
         #print('lb',lb)
         sumFl, sumFr = [],[]
         for i in range(len(newf)):
-            sumFl.append(np.trapz(newf[:i],x=newtime_l[:i]))
-            sumFr.append(np.trapz(newf[:i],x=newtime_r[:i]))
+            sumFl.append(np.trapezoid(newf[:i],x=newtime_l[:i]))
+            sumFr.append(np.trapezoid(newf[:i],x=newtime_r[:i]))
         sumFl,sumFr = np.array(sumFl),np.array(sumFr)
         eta0 = (sumFl+sumFr)/dind
         etac = eta0[-50:].mean()
@@ -939,7 +939,7 @@ def ProcessFile(filepath):
             emax = el*pow(newf[-1],kl)
             er = emax/pow(newf[-1],kr)
             for i in range(len(newf)):
-                diff.append((np.trapz(newf[:i]/(el*pow(newf[:i],kl)),x=newtime_l[:i])+np.trapz(newf[:i]/(er*pow(newf[:i],kr)),x=newtime_r[:i])))
+                diff.append((np.trapezoid(newf[:i]/(el*pow(newf[:i],kl)),x=newtime_l[:i])+np.trapezoid(newf[:i]/(er*pow(newf[:i],kr)),x=newtime_r[:i])))
             diff = np.array(diff)
             
             return np.abs(dind-diff)[lb:].mean()
@@ -959,8 +959,8 @@ def ProcessFile(filepath):
         er = el*pow(newf[-1],kl)/pow(newf[-1],kr)
         sumFls, sumFrs = [],[]
         for i in range(len(newf)):
-            sumFls.append(np.trapz(newf[:i]/(el*pow(newf[:i],kl)),x=newtime_l[:i]))
-            sumFrs.append(np.trapz(newf[:i]/(er*pow(newf[:i],kr)),x=newtime_r[:i]))
+            sumFls.append(np.trapezoid(newf[:i]/(el*pow(newf[:i],kl)),x=newtime_l[:i]))
+            sumFrs.append(np.trapezoid(newf[:i]/(er*pow(newf[:i],kr)),x=newtime_r[:i]))
 
         sumFls,sumFrs = np.array(sumFls),np.array(sumFrs)
         ind_els = newind_l - sumFls

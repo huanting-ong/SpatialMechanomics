@@ -17,7 +17,7 @@ attrs==26.1.0
 boltons @ file:///C:/b/abs_e2_iokhxbp/croot/boltons_1751383740243/work
 botocore==1.43.0
 brotlicffi @ file:///C:/miniconda3/conda-bld/brotlicffi_1764961374486/work
-certifi @ file:///C:/Users/task_177697113348838/croot/certifi_1776971246390/work/certifi
+certifi @ file:///C:/Users/task_YAR7wApqSDOhN_0/croot/certifi_1785412605974/work/certifi
 cffi @ file:///C:/b/abs_29_b57if3f/croot/cffi_1736184144340/work
 charset-normalizer @ file:///C:/miniconda3/conda-bld/charset-normalizer_1761744975868/work
 click @ file:///C:/miniconda3/conda-bld/click_1764332372183/work
@@ -25,7 +25,7 @@ cloudpickle==3.1.2
 cmcrameri==1.9
 colorama @ file:///C:/Users/dev-admin/perseverance-python-buildout/croot/colorama_1729036581634/work
 colorcet==3.2.1
-conda @ file:///C:/Users/task_177585125271105/croot/conda_1775852147789/work/conda-src
+conda @ file:///C:/Users/task_177739509154122/croot/conda_1777395601953/work/conda-src
 conda-anaconda-telemetry @ file:///croot/conda-anaconda-telemetry_1755883788794/work
 conda-anaconda-tos @ file:///C:/b/abs_c9yejtsx9g/croot/conda-anaconda-tos_1755123332641/work
 conda-content-trust @ file:///C:/Users/task_177526614975788/croot/conda-content-trust_1775266716142/work
@@ -43,6 +43,7 @@ distributed==2026.1.1
 distro @ file:///C:/Users/dev-admin/perseverance-python-buildout/croot/distro_1729059153117/work
 docrep==0.3.2
 donfig==0.8.1.post1
+et_xmlfile @ file:///C:/b/abs_b0ifp_j3js/croot/et_xmlfile_1756462499666/work
 fast-array-utils==1.4.1
 fonttools==4.63.0
 formulaic==1.2.2
@@ -98,6 +99,7 @@ numcodecs==0.16.5
 numpy==2.4.6
 ome-zarr==0.15.0
 omnipath==1.0.12
+openpyxl @ file:///C:/b/abs_6cdczthntz/croot/openpyxl_1736371239628/work
 packaging==26.0
 pandas==2.3.3
 param==2.4.1

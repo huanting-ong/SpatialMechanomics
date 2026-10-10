@@ -128,7 +128,8 @@ DEPENDENCIES
 -------------------------------------------------------------------------
 Python 3.13.13          numpy 2.4.6, pandas 2.3.3, scipy 1.17.1,
                         scikit-learn 1.9.0, statsmodels 0.14.6, patsy 1.0.2,
-                        matplotlib 3.11.0, seaborn 0.13.2, gseapy 1.3.0
+                        matplotlib 3.11.0, seaborn 0.13.2, gseapy 1.3.0,
+                        openpyxl 3.1.5
 R 4.5.1                 Seurat 5.3.1, SeuratObject 5.2.0, BPCells 0.3.1,
                         SeuratWrappers 0.4.0, Banksy 1.6.0, harmony 1.2.4,
                         SpatialExperiment 1.20.0, scran 1.38.1, scater 1.38.1,
@@ -138,6 +139,9 @@ Fiji                    ImageJ 1.53q, Java 1.8.0_322, 64-bit; script 18 only
 Imaris                  10.2.0 (Oxford Instruments); maximum intensity
                         projections of the tilt-corrected stacks
 SpatialX (BioTuring)    v2026-08-03, manual image alignment and ROI annotation
+
+Script 1 uses np.trapezoid and therefore requires NumPy 2.0 or later. It also
+requires openpyxl, which it uses to write maps.xlsx.
 
 Full environment listings as captured on the analysis workstation are in
 requirements.txt (Python) and R_sessionInfo.txt (R). Analyses were run under
@@ -187,6 +191,10 @@ Three settings recur and are worth knowing about:
                          it. Points reaching 50% in nothing are used only in
                          whole-tissue analyses. Script 16 deliberately does
                          not apply this; see above.
+
+A worked example is included. demo_data/ holds 144 raw force curves from one
+region of interest, and demo_expected_output/ holds the results table script 1
+produces from them. See README.md for how to run it.
 
 
 -------------------------------------------------------------------------
