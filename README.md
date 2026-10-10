@@ -2,7 +2,7 @@
 
 **Linking local tissue stiffness to the molecular state of the same tissue region.**
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22825608.svg)](https://doi.org/10.5281/zenodo.22825608)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23283211.svg)](https://doi.org/10.5281/zenodo.23283211)
 
 Preprint: [https://doi.org/10.64898/2026.08.29.748050](https://doi.org/10.64898/2026.08.29.748050)
 
